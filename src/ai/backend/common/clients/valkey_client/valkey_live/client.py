@@ -51,6 +51,7 @@ valkey_live_resilience = Resilience(
 )
 
 _DEFAULT_EXPIRATION = 3600  # 1 hour default expiration
+
 _SESSION_REQUESTS_SUFFIX: Final[str] = "requests"
 _SESSION_LAST_RESPONSE_SUFFIX: Final[str] = "last_response_time"
 _AGENT_LAST_SEEN_HASH: Final[str] = "agent.last_seen"

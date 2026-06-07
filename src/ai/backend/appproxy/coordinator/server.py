@@ -159,6 +159,7 @@ global_subapp_pkgs: Final[list[str]] = [
     ".slot_v2",
     ".worker_v1",
     ".worker_v2",
+    ".worker_v3",
 ]
 
 
