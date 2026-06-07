@@ -25,7 +25,7 @@ import logging
 import uuid as uuid_module
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import aiohttp_cors
@@ -56,9 +56,6 @@ from .utils import auth_required
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession as SASession
 
-SnapshotFormat = Literal["unified", "traefik-native", "continuum-native"]
-_VALID_FORMATS: frozenset[str] = frozenset(("unified", "traefik-native", "continuum-native"))
-
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
 
 
@@ -73,10 +70,10 @@ _HEALTH_COMPONENT = "backend-ai-appproxy-coordinator"
 def _no_store_headers() -> dict[str, str]:
     """Headers applied to every v3 response carrying authority-bound data.
 
-    SEC-4: prevents intermediate caches from retaining route snapshots or
-    refreshed tokens. ``private`` is redundant when ``no-store`` is set, but
-    keeping both makes the intent explicit for older proxies that honour the
-    weaker directive.
+    SEC-4: prevents intermediate caches from retaining route snapshots.
+    ``private`` is redundant when ``no-store`` is set, but keeping both
+    makes the intent explicit for older proxies that honour the weaker
+    directive.
     """
 
     return {"Cache-Control": "no-store, private"}
@@ -86,9 +83,8 @@ def _no_store_headers() -> dict[str, str]:
 async def get_routes(request: web.Request) -> web.StreamResponse:
     """``GET /api/v3/worker/{worker_id}/routes``.
 
-    Returns a route snapshot (200) or an empty 304 when the worker is already
-    up-to-date as determined by the ``If-None-Match`` etag and/or the
-    ``since`` route_version cursor.
+    Returns the unified route snapshot (200) or an empty 304 when the worker
+    is already up-to-date as determined by the ``If-None-Match`` etag.
 
     Response always carries:
       * ``Cache-Control: no-store, private`` (SEC-4)
@@ -99,25 +95,11 @@ async def get_routes(request: web.Request) -> web.StreamResponse:
     root_ctx: RootContext = request.app["_root.context"]
     worker_id = UUID(request.match_info["worker_id"])
 
-    fmt_raw = request.query.get("format", "unified")
-    if fmt_raw not in _VALID_FORMATS:
-        raise web.HTTPBadRequest(
-            reason=f"Unsupported format: {fmt_raw}",
-        )
-    fmt: SnapshotFormat = cast(SnapshotFormat, fmt_raw)
-    since_raw = request.query.get("since")
-    since: int | None
-    try:
-        since = int(since_raw) if since_raw is not None else None
-    except ValueError:
-        since = None
     if_none_match = request.headers.get("If-None-Match")
 
     service = RouteSnapshotService(root_ctx.db, root_ctx.valkey_live)
     snapshot = await service.get_snapshot(
         worker_id=worker_id,
-        format=fmt,
-        since=since,
         etag_hint=if_none_match,
     )
 
@@ -138,13 +120,14 @@ async def get_routes(request: web.Request) -> web.StreamResponse:
 async def heartbeat_v3(request: web.Request) -> web.StreamResponse:
     """``PATCH /api/v3/worker/{worker_id}/heartbeat``.
 
-    Workers report their liveness here. v3-polling workers (Continuum)
-    attach a :class:`WorkerSelfReport` body with the route version they
-    just applied; legacy NATIVE / TRAEFIK workers that do not poll send
-    an empty body and the coordinator treats every field as zero. Either
-    way the handler refreshes ``last_polled_at`` on the row and the
-    ``proxy-worker.last_seen`` Valkey hash that ``check_worker_lost``
-    consults.
+    Workers report their liveness here. Polling workers (Continuum) attach
+    a :class:`WorkerSelfReport` body carrying ``applied_route_version`` —
+    the only field that drives the STARTING-gate transition and the
+    Valkey ``cas_max`` monotonic update. Non-polling workers (NATIVE /
+    TRAEFIK) send an empty body and the handler treats them as a plain
+    liveness signal. Either way the handler refreshes ``last_polled_at``
+    on the row and the ``proxy-worker.last_seen`` Valkey hash that
+    ``check_worker_lost`` consults.
     """
 
     root_ctx: RootContext = request.app["_root.context"]
@@ -169,13 +152,13 @@ async def heartbeat_v3(request: web.Request) -> web.StreamResponse:
     async def _update(sess: SASession) -> str:
         worker = await Worker.get(sess, worker_id)
         worker.last_polled_at = now
-        # OPS-2 mitigation: a v3-polling worker stays in STARTING until
-        # the data plane actually applies its first snapshot. Promote
+        # OPS-2 mitigation: a polling worker stays in STARTING until the
+        # data plane actually applies its first snapshot. Promote
         # STARTING → ALIVE inside the same transaction as
         # ``last_polled_at`` so the cold-start gate flips atomically;
         # ALIVE workers are eligible for pick_worker assignment from the
-        # next request onward. For workers without a polling subprocess
-        # the body is empty and we simply keep them ALIVE.
+        # next request onward. For non-polling workers the body is empty
+        # and we simply keep them ALIVE.
         if worker.status == WorkerStatus.STARTING and applied_route_version > 0:
             worker.status = WorkerStatus.ALIVE
             log.info(
@@ -257,6 +240,10 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
     ``WorkerResponseModel`` (worker row + slots) so older Python workers
     can refresh their cached slot list, while v3 returns the minimal
     :class:`WorkerRegistrationResponseV3` (worker id only).
+
+    The endpoint itself signals "this is a polling worker" — handlers
+    flip the initial status to STARTING when the resolved backend_kind
+    is CONTINUUM (polling). The legacy v2 endpoint enters at ALIVE.
     """
 
     root_ctx: RootContext = request.app["_root.context"]
@@ -271,27 +258,23 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
         raise GenericBadRequest(f"Invalid WorkerRegistrationRequest: {e}") from e
 
     # Apply v3-specific defaults — Continuum callers may omit
-    # mode/backend_kind, in which case we infer external-backend +
-    # continuum from the endpoint default. ``WorkerMode`` (self-hosted vs
-    # external-backend) is derived from ``backend_kind`` via
-    # :attr:`BackendKind.worker_mode` and is not stored as a separate column.
+    # backend_kind, in which case CONTINUUM is the inferred default for
+    # this endpoint. ``WorkerMode`` (self-hosted vs external-backend) is
+    # derived from ``backend_kind`` via :attr:`BackendKind.worker_mode`
+    # and is not stored as a separate column.
     backend_kind = params.backend_kind or BackendKind.CONTINUUM
 
-    capabilities = params.capabilities or {}
-    scope = params.scope or {}
-
-    # OPS-2: workers that declare ``supports_v3_polling`` start in
-    # STARTING and transition to ALIVE on the first heartbeat carrying
-    # ``applied_route_version > 0``.
-    supports_v3_polling = bool(capabilities.get("supports_v3_polling"))
-    initial_status = WorkerStatus.STARTING if supports_v3_polling else WorkerStatus.ALIVE
+    # OPS-2: polling workers start in STARTING and transition to ALIVE
+    # on the first heartbeat carrying ``applied_route_version > 0``.
+    is_polling = backend_kind == BackendKind.CONTINUUM
+    initial_status = WorkerStatus.STARTING if is_polling else WorkerStatus.ALIVE
     accepted_traffics = list(params.accepted_traffics)
     port_range: tuple[int, int] | None = (
         (params.port_range[0], params.port_range[1]) if params.port_range else None
     )
     authority = params.authority
 
-    async def _upsert(sess: SASession) -> tuple[UUID, int, dict[str, Any]]:
+    async def _upsert(sess: SASession) -> UUID:
         try:
             worker = await Worker.find_by_authority(sess, authority)
             worker.frontend_mode = params.frontend_mode
@@ -310,14 +293,10 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
                 worker.traefik_last_used_marker_path = params.traefik_last_used_marker_path
             worker.filtered_apps_only = params.filtered_apps_only
             worker.backend_kind = backend_kind
-            if capabilities:
-                worker.capabilities = capabilities
-            if scope:
-                worker.scope = scope
             worker.updated_at = datetime.now(UTC)
             worker.nodes += 1
             worker.status = initial_status
-            return worker.id, dict(scope) if scope else {}
+            return worker.id
         except ObjectNotFound:
             worker = Worker.create(
                 uuid_module.uuid4(),
@@ -337,14 +316,10 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
                 status=initial_status,
                 backend_kind=backend_kind,
             )
-            if capabilities:
-                worker.capabilities = capabilities
-            if scope:
-                worker.scope = scope
             sess.add(worker)
             await sess.flush()
             await sess.refresh(worker)
-            return worker.id, dict(scope) if scope else {}
+            return worker.id
 
     async def _sync_app_filters(sess: SASession, worker_id: UUID) -> None:
         """Idempotently merge declared ``app_filters`` into the row.
@@ -371,15 +346,13 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
                 )
                 sess.add(filter_row)
 
-    async def _upsert_and_filters(
-        sess: SASession,
-    ) -> tuple[UUID, int, dict[str, Any]]:
-        result = await _upsert(sess)
-        await _sync_app_filters(sess, result[0])
-        return result
+    async def _upsert_and_filters(sess: SASession) -> UUID:
+        worker_id = await _upsert(sess)
+        await _sync_app_filters(sess, worker_id)
+        return worker_id
 
     async with root_ctx.db.connect() as db_conn:
-        worker_id, _scope_dict = await execute_with_txn_retry(
+        worker_id = await execute_with_txn_retry(
             _upsert_and_filters, root_ctx.db.begin_session, db_conn
         )
 
