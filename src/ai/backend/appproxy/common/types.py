@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import (
     Annotated,
     Any,
+    Literal,
     TypeVar,
 )
 from uuid import UUID
@@ -30,6 +31,38 @@ class FrontendServerMode(enum.StrEnum):
     WILDCARD_DOMAIN = "wildcard"
     PORT = "port"
     TRAEFIK = "traefik"
+    CONTINUUM = "continuum"
+
+
+class BackendKind(enum.StrEnum):
+    """Which data-plane backend the worker drives.
+
+    NATIVE: the worker hosts its own aiohttp / nghttpx / TCP listener — the
+        data plane lives inside the worker process itself.
+    TRAEFIK: the worker is an event-monitor for an externally managed Traefik
+        instance (etcd push + UDS marker socket).
+    CONTINUUM: the worker IS the Continuum Router (Rust binary) — there is
+        no separate Python worker process.
+
+    Note: legacy code referred to a parallel ``WorkerMode`` enum
+    (``self-hosted`` for NATIVE, ``external-backend`` for TRAEFIK / CONTINUUM).
+    That distinction is fully determined by :attr:`BackendKind.worker_mode` and
+    the enum itself was retired — every place that needed the string can read
+    it off the ``BackendKind`` value.
+    """
+
+    NATIVE = "native"
+    TRAEFIK = "traefik"
+    CONTINUUM = "continuum"
+
+    @property
+    def worker_mode(self) -> Literal["self-hosted", "external-backend"]:
+        """Whether the worker hosts the data plane itself (``self-hosted``)
+        or drives an external data-plane component (``external-backend``).
+        Derived purely from the kind; the enum value is the same string the
+        old ``WorkerMode`` enum used so on-wire telemetry stays compatible.
+        """
+        return "self-hosted" if self is BackendKind.NATIVE else "external-backend"
 
 
 class ProxyProtocol(enum.StrEnum):

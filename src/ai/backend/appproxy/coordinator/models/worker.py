@@ -22,6 +22,7 @@ from ai.backend.appproxy.common.errors import (
 )
 from ai.backend.appproxy.common.types import (
     AppMode,
+    BackendKind,
     EndpointConfig,
     FrontendMode,
     ProxyProtocol,
@@ -37,16 +38,103 @@ from .circuit import Circuit
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
 
+# Default ordering of backend_kind for pick_worker tie-break. Workers with
+# kinds earlier in this list are preferred when multiple workers can serve
+# the same circuit. EXTERNAL_BACKEND variants (continuum, traefik) are
+# preferred over NATIVE because they expose richer routing capabilities
+# (smart routing, response caching, fallback chains) at no extra cost when
+# the workload doesn't require them. NATIVE remains a valid fallback for
+# workers that don't run an external dataplane.
+_PICK_WORKER_BACKEND_KIND_PRIORITY: dict[BackendKind, int] = {
+    BackendKind.CONTINUUM: 0,
+    BackendKind.TRAEFIK: 1,
+    BackendKind.NATIVE: 2,
+}
+
 __all__ = [
     "Worker",
     "WorkerAppFilter",
     "WorkerStatus",
+    "_is_polling_ready",
     "add_circuit",
+    "is_v3_polling_active",
     "pick_worker",
 ]
 
 
+# OB-OPS-1 mitigation predicate. See:
+#   - is_v3_polling_active() below for the full rationale.
+#   - ai.backend.appproxy.coordinator.types.CircuitManager for the consumer
+#     sites that gate AppProxyCircuit*Event broadcasts on this predicate.
+_V3_POLLING_CAPABILITY_KEY = "supports_v3_polling"
+
+
+def is_v3_polling_active(worker: "Worker") -> bool:
+    """Return True iff the worker has fully cut over to v3 snapshot polling.
+
+    OB-OPS-1 rollout-ordering mitigation:
+        A worker may declare ``supports_v3_polling = True`` in its
+        ``capabilities`` payload at registration time, but the coordinator
+        cannot stop emitting legacy ``AppProxyCircuit*Event`` broadcasts to
+        that worker until the worker has actually pulled and applied at
+        least one snapshot. Until then, the worker still depends on the
+        event stream to learn about circuits, and silently dropping the
+        events would leave it with an empty / stale route table.
+
+        We therefore require BOTH:
+          1. ``capabilities['supports_v3_polling']`` is truthy — the worker
+             declared it can poll snapshots.
+          2. ``committed_route_version > 0`` — the worker has reported back
+             at least one successfully applied snapshot, so it is now the
+             authoritative source for its own routing state and the legacy
+             event channel can be safely silenced.
+
+        Either condition alone is insufficient:
+          * (1) alone is the rollout-ordering bug: capability flipped but
+            no snapshot yet applied.
+          * (2) alone never happens in practice (workers that don't poll
+            cannot commit a route version), but the explicit check keeps
+            the predicate robust against future code paths that might
+            seed ``committed_route_version`` for other reasons.
+
+    The check is intentionally a plain dict lookup (no SQL) so it is cheap
+    enough to call once per broadcast target.
+    """
+    capabilities = worker.capabilities or {}
+    if not capabilities.get(_V3_POLLING_CAPABILITY_KEY):
+        return False
+    return worker.committed_route_version > 0
+
+
+def _is_polling_ready(worker: "Worker") -> bool:
+    """OB-COMP-4 mitigation: only v3-polling workers must show
+    ``committed_route_version > 0`` before they become candidates for
+    ``pick_worker``. Legacy NATIVE / SELF_HOSTED workers never call the v3
+    polling endpoints, so their ``committed_route_version`` stays at the
+    seed value of 0 forever — applying the freshness gate uniformly would
+    permanently exclude them from circuit assignment (silent regression).
+
+    The check mirrors the capability lookup used by ``is_v3_polling_active``:
+        * If the worker did NOT declare ``supports_v3_polling``, return True
+          unconditionally — it is a legacy worker exempt from the gate.
+        * If it DID declare the capability, require at least one applied
+          snapshot (``committed_route_version > 0``) before it is eligible.
+    """
+    capabilities = worker.capabilities or {}
+    if not capabilities.get(_V3_POLLING_CAPABILITY_KEY):
+        return True
+    return worker.committed_route_version > 0
+
+
 class WorkerStatus(StrEnum):
+    # OPS-2 mitigation: STARTING marks a worker that has registered but has
+    # not yet confirmed it can serve traffic. v3-polling workers stay in
+    # STARTING until the Continuum subprocess applies its first snapshot
+    # (signalled by ``applied_route_version > 0`` in the heartbeat). The
+    # ``pick_worker`` candidate set excludes STARTING workers so that the
+    # cold-start gap between registration and first applied snapshot cannot
+    # silently route traffic to a worker whose data-plane is empty.
+    STARTING = "STARTING"
     ALIVE = "ALIVE"
     LOST = "LOST"
     TERMINATED = "TERMINATED"
@@ -60,8 +148,12 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
     )
 
     authority: Mapped[str] = mapped_column(
-        sa.String(length=255), nullable=False, unique=True
-    )  # Human-readable identity of each AppProxy worker, must be identical across all AppProxy workers under single VIP when HA is set up
+        sa.String(length=255), nullable=False
+    )  # Human-readable identity of each AppProxy worker, must be identical across all AppProxy workers under single VIP when HA is set up.
+    # NOTE: Uniqueness is enforced by the composite (authority, backend_kind)
+    # constraint declared in ``__table_args__`` — a single authority can be
+    # registered once per backend_kind so SELF_HOSTED and EXTERNAL_BACKEND
+    # variants can coexist without colliding.
     frontend_mode: Mapped[FrontendMode] = mapped_column(
         EnumType(FrontendMode), nullable=False
     )  # will be fixed as `port` when `protocol` is set to `tcp`
@@ -119,6 +211,56 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         StrEnumType(WorkerStatus),
         default=WorkerStatus.ALIVE,
         nullable=False,
+    )
+
+    # The concrete data-plane backend kind. NATIVE is self-hosted (the
+    # worker's own listener handles traffic); TRAEFIK and CONTINUUM both
+    # drive an external data-plane component. The legacy ``mode`` column
+    # (``self-hosted`` / ``external-backend``) was retired — that
+    # distinction is derived from this value via
+    # :attr:`BackendKind.worker_mode`.
+    backend_kind: Mapped[BackendKind] = mapped_column(
+        StrEnumType(BackendKind),
+        default=BackendKind.NATIVE,
+        server_default=BackendKind.NATIVE.value,
+        nullable=False,
+    )
+
+    capabilities: Mapped[dict[str, Any]] = mapped_column(
+        pgsql.JSONB,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+        nullable=False,
+    )  # v3 polling capability declaration: supports_v3_polling, formats, poll_interval_ms
+
+    scope: Mapped[dict[str, Any]] = mapped_column(
+        pgsql.JSONB,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+        nullable=False,
+    )  # Worker routing scope: project_ids, scaling_group, backend_kinds
+
+    poll_token_revision: Mapped[int] = mapped_column(
+        sa.BigInteger,
+        default=0,
+        server_default=sa.text("0"),
+        nullable=False,
+    )  # Bumped on every refresh-token / revoke — old tokens become invalid
+
+    committed_route_version: Mapped[int] = mapped_column(
+        sa.BigInteger,
+        default=0,
+        server_default=sa.text("0"),
+        nullable=False,
+    )  # Last route_version the worker reported as applied — gates pick_worker
+
+    last_polled_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        sa.UniqueConstraint("authority", "backend_kind", name="uq_workers_authority_backend_kind"),
     )
 
     filters = relationship(
@@ -200,6 +342,7 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         traefik_last_used_marker_path: str | None = None,
         filtered_apps_only: bool = False,
         status: WorkerStatus = WorkerStatus.LOST,
+        backend_kind: BackendKind | None = None,
     ) -> "Worker":
         w = cls()
         w.id = id
@@ -217,6 +360,19 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         w.filtered_apps_only = filtered_apps_only
         w.traefik_last_used_marker_path = traefik_last_used_marker_path
         w.status = status
+
+        # backend_kind resolution order:
+        # (1) explicit backend_kind from the v3-aware worker payload — wins
+        #     when present (e.g. CONTINUUM).
+        # (2) traefik_last_used_marker_path heuristic — legacy fallback for
+        #     pre-v3 Python workers that don't ship backend_kind.
+        # (3) default NATIVE.
+        if backend_kind is not None:
+            w.backend_kind = backend_kind
+        elif traefik_last_used_marker_path is not None:
+            w.backend_kind = BackendKind.TRAEFIK
+        else:
+            w.backend_kind = BackendKind.NATIVE
 
         w.occupied_slots = 0
         match frontend_mode:
@@ -248,6 +404,12 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         if should_include_port:
             base_url += f":{self.api_port}"
         return URL(base_url)
+
+    def bump_poll_token_revision(self) -> int:
+        """Atomically bump the revision counter; returns new value. Call this from
+        refresh-token handler and from admin revoke endpoint."""
+        self.poll_token_revision += 1
+        return self.poll_token_revision
 
     async def list_slots(self, session: AsyncSession) -> list[Slot]:
         """
@@ -363,6 +525,12 @@ async def pick_worker(
     worker_ids = [app_filter.worker for app_filter in filter_result.scalars().all()]
 
     log.debug("protocol: {} ({})", protocol, type(protocol))
+    # OPS-2: Only ALIVE workers are eligible for circuit assignment.
+    # STARTING workers (registered but not yet serving traffic — v3 polling
+    # workers awaiting their first applied snapshot) are intentionally
+    # excluded here so the Continuum cold-start gap cannot leak traffic to
+    # a worker whose data-plane is still empty. LOST/TERMINATED were
+    # already excluded by the strict ALIVE match.
     worker_query = sa.select(Worker).where(
         (Worker.protocol == protocol)
         & (Worker.accepted_traffics.contains([app_mode]))
@@ -373,19 +541,32 @@ async def pick_worker(
             Worker.filtered_apps_only & (Worker.accepted_traffics.contains(app_mode))
         )
     result = await session.execute(worker_query)
+    # Sort key (ascending — first element = highest priority):
+    #   1. backend_kind priority (CONTINUUM < TRAEFIK < NATIVE) so that
+    #      external-backend workers are preferred when available.
+    #   2. WILDCARD_DOMAIN frontends ahead of PORT frontends (legacy rule).
+    #   3. Within the same group, most-free slot wins (least negative remaining).
+    #
+    # COMP-4 mitigation: the ``_is_polling_ready`` predicate filters out v3
+    # polling workers that have not yet applied a snapshot
+    # (committed_route_version == 0) so their empty data-plane cannot
+    # receive traffic. Legacy NATIVE / SELF_HOSTED workers never poll, so
+    # the predicate intentionally exempts them — gating uniformly on
+    # ``committed_route_version > 0`` would permanently exclude every
+    # legacy worker (silent regression).
     sorted_workers: list[Worker] = [
         f
         for f in sorted(
             result.scalars().all(),
             key=lambda f: (
-                -1
-                if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN
-                else (f.available_slots - f.occupied_slots) * -1
+                _PICK_WORKER_BACKEND_KIND_PRIORITY.get(f.backend_kind, 99),
+                0 if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN else 1,
+                (f.occupied_slots - f.available_slots),
             ),
-            reverse=True,
         )
         if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN
         or (f.available_slots - f.occupied_slots) > 0
+        if _is_polling_ready(f)  # COMP-4: v3 workers must have applied snapshot; NATIVE exempt.
     ]
     if not sorted_workers:
         raise WorkerNotAvailable
