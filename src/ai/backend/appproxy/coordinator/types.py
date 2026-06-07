@@ -49,7 +49,7 @@ from .config import ServerConfig
 from .defs import LockID
 from .models import Circuit
 from .models.utils import ExtendedAsyncSAEngine
-from .models.worker import Worker
+from .models.worker import Worker, is_v3_polling_active
 
 if TYPE_CHECKING:
     from .services.endpoint import EndpointService
@@ -162,6 +162,18 @@ class CircuitManager:
         worker_ready_evt = asyncio.Event()
         authority = circuit.worker_row.authority
 
+        # OB-OPS-1 mitigation: if the target worker has already completed the
+        # v3-polling cutover (declared supports_v3_polling AND committed at
+        # least one route snapshot), the legacy
+        # AppProxyCircuitCreatedEvent / AppProxyWorkerCircuitAddedEvent
+        # round-trip is dead weight — the worker no longer subscribes. We
+        # short-circuit here so we neither block on an event that will never
+        # arrive nor publish into a channel nobody is reading. Workers that
+        # only meet condition (1) still get the event because they have not
+        # yet proven they can serve themselves from snapshots.
+        if is_v3_polling_active(circuit.worker_row):
+            return
+
         async def _event_handler(
             _context: CircuitManager,
             _agent_id: AgentId,
@@ -257,7 +269,18 @@ class CircuitManager:
         # circuit event would require a new wire shape on the worker
         # side, which is out of scope for this change. Healthy-route
         # filtering remains worker-side.
+        #
+        # OB-OPS-1 mitigation: filter out circuits whose target worker has
+        # already fully cut over to v3 snapshot polling. The route_version
+        # change is implicit in the next snapshot that worker pulls (the
+        # content-hash route_version in route_snapshot.py is recomputed
+        # from live DB state), so re-emitting it as a legacy event is both
+        # redundant and — worse — silently dropped, masking the cutover.
+        # We skip *per-worker*, not for the whole batch, so a mixed pool of
+        # legacy and v3-active workers still receives the events it needs.
         for item in items:
+            if is_v3_polling_active(item.circuit.worker_row):
+                continue
             event = AppProxyCircuitRouteUpdatedEvent(
                 target_worker_authority=item.circuit.worker_row.authority,
                 circuit=SerializableCircuit(**item.circuit.dump_model()),
@@ -390,6 +413,16 @@ class CircuitManager:
             log.info("reconcile_traefik_etcd_state: dropped {} stale circuit(s)", dropped)
 
     async def unload_legacy_circuit(self, circuit: Circuit) -> None:
+        # OB-OPS-1 mitigation: skip the legacy removal broadcast for workers
+        # that have already cut over to v3 snapshot polling. The circuit
+        # row deletion that triggered this call is the source of truth — a
+        # v3-active worker observes the disappearance on its next snapshot
+        # poll (the absent circuit yields a new content-hash route_version
+        # and the circuit is dropped from the routes_view). Emitting the
+        # event anyway is harmless on the wire but obscures intent and was
+        # historically the silent failure mode that masked OB-OPS-1.
+        if is_v3_polling_active(circuit.worker_row):
+            return
         event = AppProxyCircuitRemovedEvent(
             target_worker_authority=circuit.worker_row.authority,
             circuits=[SerializableCircuit(**circuit.dump_model())],
