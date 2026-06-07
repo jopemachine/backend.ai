@@ -192,10 +192,9 @@ def _build_registration_request(root_ctx: RootContext) -> WorkerRegistrationRequ
         if local_config.proxy_worker.traefik
         else None,
         "backend_kind": backend_kind,
-        # NATIVE / TRAEFIK Python workers do NOT speak v3 polling — the
-        # Coordinator should NOT enter STARTING-until-first-apply mode for
-        # these workers; legacy event-driven push is authoritative.
-        "capabilities": {"supports_v3_polling": False},
+        # Polling-vs-push is determined by backend_kind on the Coordinator
+        # side (CONTINUUM → polling, others → push) and does not need to
+        # be re-advertised in the payload.
         **extra_fields,
     })
 
