@@ -35,7 +35,13 @@ import uvloop
 from aiohttp import web
 from aiohttp.web_app import CleanupError
 from setproctitle import setproctitle
-from tenacity import AsyncRetrying, TryAgain, retry_if_exception_type, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    TryAgain,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from ai.backend.appproxy.common.config import get_default_redis_key_ttl
 from ai.backend.appproxy.common.defs import (
@@ -443,9 +449,14 @@ async def proxy_frontend_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
 
 @asynccontextmanager
 async def worker_registration_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
+    # Hard cap on registration retries — without ``stop_after_attempt`` the
+    # worker silently retried forever if the coordinator stayed unreachable,
+    # which masked misconfiguration as "still booting" (R3 deadlock).
     async for attempt in AsyncRetrying(
-        wait=wait_exponential(multiplier=1, min=4, max=10),
+        wait=wait_exponential(multiplier=1, min=4, max=30),
+        stop=stop_after_attempt(10),
         retry=retry_if_exception_type(TryAgain),
+        reraise=True,
     ):
         with attempt:
             try:
@@ -462,6 +473,10 @@ async def worker_registration_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
         await root_ctx.proxy_frontend.register_circuit(circuit, circuit.route_info)
 
     async def _heartbeat(_interval: float) -> None:
+        # The Python worker speaks the legacy empty-body PATCH heartbeat.
+        # The v3 WorkerSelfReport heartbeat is used only by Continuum
+        # workers (continuum-router binary), which run their own Rust
+        # client and do not go through this dispatcher.
         try:
             async for attempt in AsyncRetrying(
                 wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -769,6 +784,7 @@ def build_root_app(
     subapp_pkgs: Sequence[str] = (),
 ) -> web.Application:
     root_ctx = RootContext()
+    root_ctx.poll_token = None
     root_ctx.metrics = WorkerMetricRegistry.instance()
 
     app = web.Application(

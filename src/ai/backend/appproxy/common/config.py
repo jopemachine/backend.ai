@@ -387,6 +387,20 @@ class SecretConfig(BaseSchema):
             example=ConfigExample(local="API_SECRET", prod="API_SECRET"),
         ),
     ]
+    poll_token_secret: Annotated[
+        str,
+        Field(default=""),
+        BackendAIConfigMeta(
+            description=(
+                "Dedicated HMAC secret for v3 poll-token JWTs (separate from "
+                "api_secret so a leak does not compromise the broader API). "
+                "If left blank, v3 polling endpoints are disabled."
+            ),
+            added_version="26.5.0",
+            secret=True,
+            example=ConfigExample(local="POLL_TOKEN_SECRET", prod="POLL_TOKEN_SECRET"),
+        ),
+    ]
 
 
 class LogLevel(enum.StrEnum):
