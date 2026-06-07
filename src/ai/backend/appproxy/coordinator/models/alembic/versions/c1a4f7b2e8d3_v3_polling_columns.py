@@ -1,4 +1,4 @@
-"""workers v3 polling columns (committed_route_version, last_polled_at)
+"""workers v3 polling columns (last_polled_at only)
 
 Revision ID: c1a4f7b2e8d3
 Revises: 79fd80c91957
@@ -31,17 +31,6 @@ def _column_exists(conn: sa.engine.Connection, table: str, name: str) -> bool:
 def upgrade() -> None:
     conn = op.get_bind()
 
-    if not _column_exists(conn, "workers", "committed_route_version"):
-        op.add_column(
-            "workers",
-            sa.Column(
-                "committed_route_version",
-                sa.BigInteger(),
-                nullable=False,
-                server_default=sa.text("0"),
-            ),
-        )
-
     if not _column_exists(conn, "workers", "last_polled_at"):
         op.add_column(
             "workers",
@@ -56,9 +45,5 @@ def upgrade() -> None:
 def downgrade() -> None:
     conn = op.get_bind()
 
-    for column_name in (
-        "last_polled_at",
-        "committed_route_version",
-    ):
-        if _column_exists(conn, "workers", column_name):
-            op.drop_column("workers", column_name)
+    if _column_exists(conn, "workers", "last_polled_at"):
+        op.drop_column("workers", "last_polled_at")
