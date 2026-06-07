@@ -9,6 +9,7 @@ name so the wire format converges over time.
 
 from __future__ import annotations
 
+from typing import Literal
 from uuid import UUID
 
 from pydantic import AliasChoices, AnyUrl, Field
@@ -16,6 +17,22 @@ from pydantic import AliasChoices, AnyUrl, Field
 from ai.backend.common.api_handlers import BaseFieldModel
 from ai.backend.common.config import ModelHealthCheck
 from ai.backend.common.identifier.deployment import DeploymentID
+
+# External backend kind advertised by the manager when pushing an endpoint
+# to the coordinator. ``ba_kernel`` is the historical default (Backend.AI
+# kernel session backs the inference); the ``external_*`` values let the
+# coordinator hand the route to a worker that knows how to dispatch to
+# the named third-party API (OpenAI, Anthropic, Bedrock, generic other).
+# Keeping the literal in sync with
+# ``ai.backend.appproxy.common.dto.v3.route_snapshot.BackendType`` lets the
+# value round-trip through the v3 ``ReplicaDTO`` without re-mapping.
+ExternalBackendType = Literal[
+    "ba_kernel",
+    "external_openai",
+    "external_anthropic",
+    "external_bedrock",
+    "external_other",
+]
 
 
 class SessionTagsModel(BaseFieldModel):
@@ -136,6 +153,38 @@ class CreateEndpointItem(BaseFieldModel):
             "Optional health check configuration. When present, the "
             "coordinator configures the load balancer to probe model "
             "service replicas using this path / interval / timeout."
+        ),
+    )
+    # OB-COMP-2 mitigation: additive fields so the manager can describe an
+    # endpoint whose upstream is a third-party API rather than a Backend.AI
+    # kernel. All three fields default to values that reproduce the legacy
+    # behaviour (``ba_kernel`` upstream, no credential, no extra model
+    # aliases) so older managers that omit them keep working unchanged.
+    external_backend_type: ExternalBackendType = Field(
+        default="ba_kernel",
+        description=(
+            "Upstream backend kind for routes that belong to this endpoint. "
+            "``ba_kernel`` (default) keeps the legacy Backend.AI kernel "
+            "behaviour; ``external_*`` values let the coordinator hand the "
+            "route to a worker that dispatches to the named third-party API."
+        ),
+    )
+    credential_ref: str | None = Field(
+        default=None,
+        description=(
+            "Opaque reference (e.g. ``secret://...``) to the credential "
+            "material the worker needs to call an external backend. "
+            "SEC-4: the secret value itself is never embedded in the DTO "
+            "or in downstream route snapshots."
+        ),
+    )
+    model_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional model names the router should match against when "
+            "selecting this endpoint (e.g. provider-style aliases like "
+            "``gpt-4o`` -> internal deployment name). Empty list keeps the "
+            "default name-only matching."
         ),
     )
 
