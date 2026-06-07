@@ -22,6 +22,7 @@ from ai.backend.appproxy.common.errors import (
 )
 from ai.backend.appproxy.common.types import (
     AppMode,
+    BackendKind,
     EndpointConfig,
     FrontendMode,
     ProxyProtocol,
@@ -42,8 +43,18 @@ __all__ = [
     "WorkerAppFilter",
     "WorkerStatus",
     "add_circuit",
+    "is_v3_polling_active",
     "pick_worker",
 ]
+
+
+def is_v3_polling_active(worker: "Worker") -> bool:
+    """Return True iff the worker speaks the v3 polling protocol and
+    therefore does not subscribe to the legacy ``AppProxyCircuit*Event``
+    pubsub channel. CONTINUUM is the only such backend today; NATIVE /
+    TRAEFIK keep the v2 push channel.
+    """
+    return worker.backend_kind == BackendKind.CONTINUUM
 
 
 class WorkerStatus(StrEnum):
@@ -61,7 +72,7 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
 
     authority: Mapped[str] = mapped_column(
         sa.String(length=255), nullable=False, unique=True
-    )  # Human-readable identity of each AppProxy worker, must be identical across all AppProxy workers under single VIP when HA is set up
+    )  # Human-readable identity of each AppProxy worker, must be identical across all AppProxy workers under single VIP when HA is set up.
     frontend_mode: Mapped[FrontendMode] = mapped_column(
         EnumType(FrontendMode), nullable=False
     )  # will be fixed as `port` when `protocol` is set to `tcp`
@@ -119,6 +130,24 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         StrEnumType(WorkerStatus),
         default=WorkerStatus.ALIVE,
         nullable=False,
+    )
+
+    # The concrete data-plane backend kind. NATIVE is self-hosted (the
+    # worker's own listener handles traffic); TRAEFIK and CONTINUUM both
+    # drive an external data-plane component. The legacy ``mode`` column
+    # (``self-hosted`` / ``external-backend``) was retired — that
+    # distinction is derived from this value via
+    # :attr:`BackendKind.worker_mode`.
+    backend_kind: Mapped[BackendKind] = mapped_column(
+        StrEnumType(BackendKind),
+        default=BackendKind.NATIVE,
+        server_default=BackendKind.NATIVE.value,
+        nullable=False,
+    )
+
+    last_polled_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
     )
 
     filters = relationship(
@@ -200,6 +229,7 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         traefik_last_used_marker_path: str | None = None,
         filtered_apps_only: bool = False,
         status: WorkerStatus = WorkerStatus.LOST,
+        backend_kind: BackendKind | None = None,
     ) -> "Worker":
         w = cls()
         w.id = id
@@ -217,6 +247,19 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         w.filtered_apps_only = filtered_apps_only
         w.traefik_last_used_marker_path = traefik_last_used_marker_path
         w.status = status
+
+        # backend_kind resolution order:
+        # (1) explicit backend_kind from the v3-aware worker payload — wins
+        #     when present (e.g. CONTINUUM).
+        # (2) traefik_last_used_marker_path heuristic — legacy fallback for
+        #     pre-v3 Python workers that don't ship backend_kind.
+        # (3) default NATIVE.
+        if backend_kind is not None:
+            w.backend_kind = backend_kind
+        elif traefik_last_used_marker_path is not None:
+            w.backend_kind = BackendKind.TRAEFIK
+        else:
+            w.backend_kind = BackendKind.NATIVE
 
         w.occupied_slots = 0
         match frontend_mode:
@@ -363,6 +406,12 @@ async def pick_worker(
     worker_ids = [app_filter.worker for app_filter in filter_result.scalars().all()]
 
     log.debug("protocol: {} ({})", protocol, type(protocol))
+    # OPS-2: Only ALIVE workers are eligible for circuit assignment.
+    # STARTING workers (registered but not yet serving traffic — v3 polling
+    # workers awaiting their first applied snapshot) are intentionally
+    # excluded here so the Continuum cold-start gap cannot leak traffic to
+    # a worker whose data-plane is still empty. LOST/TERMINATED were
+    # already excluded by the strict ALIVE match.
     worker_query = sa.select(Worker).where(
         (Worker.protocol == protocol)
         & (Worker.accepted_traffics.contains([app_mode]))
@@ -373,16 +422,17 @@ async def pick_worker(
             Worker.filtered_apps_only & (Worker.accepted_traffics.contains(app_mode))
         )
     result = await session.execute(worker_query)
+    # Sort key (ascending — first element = highest priority):
+    #   1. WILDCARD_DOMAIN frontends ahead of PORT frontends (legacy rule).
+    #   2. Within the same group, most-free slot wins (least negative remaining).
     sorted_workers: list[Worker] = [
         f
         for f in sorted(
             result.scalars().all(),
             key=lambda f: (
-                -1
-                if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN
-                else (f.available_slots - f.occupied_slots) * -1
+                0 if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN else 1,
+                (f.occupied_slots - f.available_slots),
             ),
-            reverse=True,
         )
         if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN
         or (f.available_slots - f.occupied_slots) > 0
