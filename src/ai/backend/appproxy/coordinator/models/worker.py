@@ -42,65 +42,22 @@ __all__ = [
     "Worker",
     "WorkerAppFilter",
     "WorkerStatus",
-    "_is_polling_ready",
     "add_circuit",
     "is_v3_polling_active",
     "pick_worker",
 ]
 
 
-def _is_polling_worker(worker: "Worker") -> bool:
-    """Polling-worker check. CONTINUUM is the only polling backend today;
-    NATIVE / TRAEFIK keep the v2 push channel. When NATIVE/TRAEFIK go
-    polling in a future iteration the check expands here in one place.
+def is_v3_polling_active(worker: "Worker") -> bool:
+    """Return True iff the worker speaks the v3 polling protocol and
+    therefore does not subscribe to the legacy ``AppProxyCircuit*Event``
+    pubsub channel. CONTINUUM is the only such backend today; NATIVE /
+    TRAEFIK keep the v2 push channel.
     """
     return worker.backend_kind == BackendKind.CONTINUUM
 
 
-def is_v3_polling_active(worker: "Worker") -> bool:
-    """Return True iff the worker has fully cut over to v3 snapshot polling.
-
-    OB-OPS-1 rollout-ordering mitigation:
-        A polling worker registers via the v3 endpoint, but the coordinator
-        cannot stop emitting legacy ``AppProxyCircuit*Event`` broadcasts to
-        that worker until the worker has actually pulled and applied at
-        least one snapshot. Until then, the worker still depends on the
-        event stream to learn about circuits, and silently dropping the
-        events would leave it with an empty / stale route table.
-
-        We therefore require BOTH:
-          1. The worker is a polling worker (``backend_kind == CONTINUUM``).
-          2. ``committed_route_version > 0`` — the worker has reported back
-             at least one successfully applied snapshot, so it is now the
-             authoritative source for its own routing state and the legacy
-             event channel can be safely silenced.
-    """
-    if not _is_polling_worker(worker):
-        return False
-    return worker.committed_route_version > 0
-
-
-def _is_polling_ready(worker: "Worker") -> bool:
-    """OB-COMP-4 mitigation: only polling workers must show
-    ``committed_route_version > 0`` before they become candidates for
-    ``pick_worker``. Push workers (NATIVE / TRAEFIK) never poll, so their
-    ``committed_route_version`` stays at 0 — applying the freshness gate
-    uniformly would permanently exclude them from circuit assignment.
-    """
-    if not _is_polling_worker(worker):
-        return True
-    return worker.committed_route_version > 0
-
-
 class WorkerStatus(StrEnum):
-    # OPS-2 mitigation: STARTING marks a worker that has registered but has
-    # not yet confirmed it can serve traffic. v3-polling workers stay in
-    # STARTING until the Continuum subprocess applies its first snapshot
-    # (signalled by ``applied_route_version > 0`` in the heartbeat). The
-    # ``pick_worker`` candidate set excludes STARTING workers so that the
-    # cold-start gap between registration and first applied snapshot cannot
-    # silently route traffic to a worker whose data-plane is empty.
-    STARTING = "STARTING"
     ALIVE = "ALIVE"
     LOST = "LOST"
     TERMINATED = "TERMINATED"
@@ -187,13 +144,6 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         server_default=BackendKind.NATIVE.value,
         nullable=False,
     )
-
-    committed_route_version: Mapped[int] = mapped_column(
-        sa.BigInteger,
-        default=0,
-        server_default=sa.text("0"),
-        nullable=False,
-    )  # Last route_version the worker reported as applied — gates pick_worker
 
     last_polled_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True),
@@ -473,18 +423,8 @@ async def pick_worker(
         )
     result = await session.execute(worker_query)
     # Sort key (ascending — first element = highest priority):
-    #   1. backend_kind priority (CONTINUUM < TRAEFIK < NATIVE) so that
-    #      external-backend workers are preferred when available.
-    #   2. WILDCARD_DOMAIN frontends ahead of PORT frontends (legacy rule).
-    #   3. Within the same group, most-free slot wins (least negative remaining).
-    #
-    # COMP-4 mitigation: the ``_is_polling_ready`` predicate filters out v3
-    # polling workers that have not yet applied a snapshot
-    # (committed_route_version == 0) so their empty data-plane cannot
-    # receive traffic. Legacy NATIVE / SELF_HOSTED workers never poll, so
-    # the predicate intentionally exempts them — gating uniformly on
-    # ``committed_route_version > 0`` would permanently exclude every
-    # legacy worker (silent regression).
+    #   1. WILDCARD_DOMAIN frontends ahead of PORT frontends (legacy rule).
+    #   2. Within the same group, most-free slot wins (least negative remaining).
     sorted_workers: list[Worker] = [
         f
         for f in sorted(
@@ -496,7 +436,6 @@ async def pick_worker(
         )
         if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN
         or (f.available_slots - f.occupied_slots) > 0
-        if _is_polling_ready(f)  # COMP-4: v3 workers must have applied snapshot; NATIVE exempt.
     ]
     if not sorted_workers:
         raise WorkerNotAvailable
