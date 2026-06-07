@@ -3,9 +3,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 import textwrap
-import uuid
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
@@ -15,8 +14,6 @@ from aiohttp import web
 from dateutil.tz import tzutc
 from pydantic import Field
 
-from ai.backend.appproxy.common.config import get_default_redis_key_ttl
-from ai.backend.appproxy.common.errors import ObjectNotFound
 from ai.backend.appproxy.common.events import DoCheckWorkerLostEvent, WorkerLostEvent
 from ai.backend.appproxy.common.types import (
     AppMode,
@@ -28,22 +25,19 @@ from ai.backend.appproxy.common.types import (
     WebMiddleware,
 )
 from ai.backend.appproxy.common.utils import (
-    pydantic_api_handler,
     pydantic_api_response_handler,
 )
-from ai.backend.appproxy.coordinator.models import Token, Worker, WorkerAppFilter, WorkerStatus
-from ai.backend.appproxy.coordinator.models.utils import execute_with_txn_retry
+from ai.backend.appproxy.coordinator.models import Token, Worker, WorkerStatus
 from ai.backend.appproxy.coordinator.types import RootContext
 from ai.backend.common.events.dispatcher import EventHandler
 from ai.backend.common.types import AgentId, BackendAISchema
 from ai.backend.logging import BraceStyleAdapter
 
-from .types import CircuitListResponseModel, SlotModel, StubResponseModel
+from .types import CircuitListResponseModel, SlotModel
 from .utils import auth_required
 
 if TYPE_CHECKING:
     pass
-    from sqlalchemy.ext.asyncio import AsyncSession as SASession
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
 
@@ -72,14 +66,22 @@ class WorkerModel(BackendAISchema):
 
     accepted_traffics: list[AppMode]
 
+    # Optional explicit mode / backend_kind sent by v3-aware workers. Older
+    # workers omit these; the model defaults to ``None`` and the receiving
+    # code falls back to the legacy traefik_marker heuristic.
+    mode: Annotated[str | None, Field(default=None)]
+    backend_kind: Annotated[str | None, Field(default=None)]
+    # OPS-2: v3-polling-aware workers declare their capabilities at
+    # registration time. The coordinator uses ``supports_v3_polling`` to
+    # decide whether to start the worker in STARTING (must wait for first
+    # applied snapshot) or ALIVE (legacy event-driven path is authoritative
+    # at boot, so no warm-up window is required).
+    capabilities: Annotated[dict[str, Any] | None, Field(default=None)]
+
 
 class AppFilter(BackendAISchema):
     key: str
     value: str
-
-
-class WorkerRequestModel(WorkerModel):
-    app_filters: Annotated[list[AppFilter], Field(default=[])]
 
 
 class WorkerResponseModel(WorkerModel):
@@ -188,131 +190,6 @@ async def list_worker_circuits(request: web.Request) -> PydanticResponse[Circuit
 
 
 @auth_required("worker")
-@pydantic_api_handler(WorkerRequestModel)
-async def update_worker(
-    request: web.Request, params: WorkerRequestModel
-) -> PydanticResponse[WorkerResponseModel]:
-    """
-    Registers worker to coordinator.
-    """
-
-    root_ctx: RootContext = request.app["_root.context"]
-
-    async def _update(sess: SASession) -> dict[str, Any]:
-        try:
-            worker = await Worker.find_by_authority(sess, params.authority)
-            worker.frontend_mode = params.frontend_mode
-            worker.protocol = params.protocol
-            worker.hostname = params.hostname
-            worker.tls_listen = params.tls_listen
-            worker.tls_advertised = params.tls_advertised
-            worker.api_port = params.api_port
-            worker.port_range = params.port_range
-            worker.wildcard_domain = params.wildcard_domain
-            worker.wildcard_traffic_port = params.wildcard_traffic_port
-            worker.filtered_apps_only = params.filtered_apps_only
-            worker.traefik_last_used_marker_path = params.traefik_last_used_marker_path
-            worker.updated_at = datetime.now(UTC)
-            worker.nodes += 1
-            worker.status = WorkerStatus.ALIVE
-        except ObjectNotFound:
-            worker = Worker.create(
-                uuid.uuid4(),
-                params.authority,
-                params.frontend_mode,
-                params.protocol,
-                params.hostname,
-                params.tls_listen,
-                params.tls_advertised,
-                params.api_port,
-                params.accepted_traffics,
-                port_range=params.port_range,
-                wildcard_domain=params.wildcard_domain,
-                wildcard_traffic_port=params.wildcard_traffic_port,
-                filtered_apps_only=params.filtered_apps_only,
-                traefik_last_used_marker_path=params.traefik_last_used_marker_path,
-                status=WorkerStatus.ALIVE,
-            )
-            sess.add(worker)
-            await sess.flush()
-            await sess.refresh(worker)
-
-        for filter in params.app_filters:
-            try:
-                await WorkerAppFilter.find_by_rule(sess, worker.id, filter.key, filter.value)
-            except ObjectNotFound:
-                filter_row = WorkerAppFilter.create(
-                    uuid.uuid4(),
-                    property_name=filter.key,
-                    property_value=filter.value,
-                    worker=worker.id,
-                )
-                sess.add(filter_row)
-
-        result = dict(worker.dump_model())
-        result["slots"] = [
-            SlotModel(**dataclasses.asdict(s)) for s in (await worker.list_slots(sess))
-        ]
-        log.info("Worker {} joined", worker.authority)
-        return result
-
-    async with root_ctx.db.connect() as db_conn:
-        result = await execute_with_txn_retry(_update, root_ctx.db.begin_session, db_conn)
-    return PydanticResponse(WorkerResponseModel(**result))
-
-
-@auth_required("worker")
-@pydantic_api_response_handler
-async def delete_worker(request: web.Request) -> PydanticResponse[StubResponseModel]:
-    """
-    Deassociates worker from coordinator.
-    """
-    root_ctx: RootContext = request.app["_root.context"]
-    worker_id = UUID(request.match_info["worker_id"])
-
-    async def _update(sess: SASession) -> None:
-        worker = await Worker.get(sess, worker_id)
-        worker.nodes -= 1
-        if worker.nodes == 0:
-            worker.status = WorkerStatus.LOST
-
-    async with root_ctx.db.connect() as db_conn:
-        await execute_with_txn_retry(_update, root_ctx.db.begin_session, db_conn)
-    return PydanticResponse(StubResponseModel(success=True))
-
-
-@auth_required("worker")
-@pydantic_api_response_handler
-async def heartbeat_worker(request: web.Request) -> PydanticResponse[WorkerResponseModel]:
-    root_ctx: RootContext = request.app["_root.context"]
-    worker_id = UUID(request.match_info["worker_id"])
-    now = datetime.now(tzutc())
-
-    async def _update(sess: SASession) -> dict[str, Any]:
-        worker = await Worker.get(sess, worker_id)
-        worker.updated_at = datetime.now(UTC)
-        worker.status = WorkerStatus.ALIVE
-        result = dict(worker.dump_model())
-        result["slots"] = [
-            SlotModel(**dataclasses.asdict(s)) for s in (await worker.list_slots(sess))
-        ]
-
-        # Update "last seen" timestamp for liveness tracking
-        ttl = get_default_redis_key_ttl()
-        await root_ctx.valkey_live.hset_with_expiry(
-            "proxy-worker.last_seen",
-            {worker.authority: str(now.timestamp())},
-            ttl,
-        )
-        return result
-
-    async with root_ctx.db.connect() as db_conn:
-        result = await execute_with_txn_retry(_update, root_ctx.db.begin_session, db_conn)
-    request["do_not_print_access_log"] = True
-    return PydanticResponse(WorkerResponseModel(**result))
-
-
-@auth_required("worker")
 @pydantic_api_response_handler
 async def get_token(request: web.Request) -> PydanticResponse[TokenResponseModel]:
     """
@@ -343,7 +220,9 @@ async def check_worker_lost(
             workers = await Worker.list_workers(sess)
             worker_map = {w.authority: w for w in workers}
 
+        seen_authorities: set[str] = set()
         for worker_id_str, prev_str in msg_data.items():
+            seen_authorities.add(worker_id_str)
             prev = datetime.fromtimestamp(float(prev_str), tzutc())
             if (
                 (now - prev) > timeout
@@ -352,6 +231,14 @@ async def check_worker_lost(
             ):
                 await root_ctx.event_producer.anycast_event(
                     WorkerLostEvent(worker_id_str, "heartbeat timeout")
+                )
+        # ALIVE workers whose last_seen entry expired from Valkey count as
+        # lost too — without this, a stale ALIVE row can hold pick_worker
+        # slots forever.
+        for authority, worker in worker_map.items():
+            if worker.status == WorkerStatus.ALIVE and authority not in seen_authorities:
+                await root_ctx.event_producer.anycast_event(
+                    WorkerLostEvent(authority, "last_seen missing in valkey")
                 )
     except Exception:
         log.exception("check_worker_lost(): exception:")
@@ -391,10 +278,11 @@ def create_app(
     cors = aiohttp_cors.setup(app, defaults=default_cors_options)
     add_route = app.router.add_route
     root_resource = cors.add(app.router.add_resource(r""))
+    # Worker registration, heartbeat, and deregistration are owned by the v3
+    # protocol (see ``worker_v3.py``). The v2 module retains only the
+    # read-only / admin endpoints — listing, single-worker inspection, and
+    # the legacy token-lookup used by the conf middleware.
     cors.add(root_resource.add_route("GET", list_workers))
-    cors.add(root_resource.add_route("PUT", update_worker))
     cors.add(add_route("GET", "/{worker_id}", get_worker))
-    cors.add(add_route("PATCH", "/{worker_id}", heartbeat_worker))
     cors.add(add_route("GET", "/{worker_id}/circuits", list_worker_circuits))
-    cors.add(add_route("DELETE", "/{worker_id}", delete_worker))
     return app, []
