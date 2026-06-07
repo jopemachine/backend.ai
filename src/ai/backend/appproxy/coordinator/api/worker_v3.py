@@ -37,7 +37,6 @@ from ai.backend.appproxy.common.dto.worker_contract import (
     WorkerHeartbeatResponse,
     WorkerRegistrationRequest,
     WorkerRegistrationResponseV3,
-    WorkerSelfReport,
 )
 from ai.backend.appproxy.common.errors import GenericBadRequest, ObjectNotFound
 from ai.backend.appproxy.common.types import (
@@ -120,77 +119,33 @@ async def get_routes(request: web.Request) -> web.StreamResponse:
 async def heartbeat_v3(request: web.Request) -> web.StreamResponse:
     """``PATCH /api/v3/worker/{worker_id}/heartbeat``.
 
-    Workers report their liveness here. Polling workers (Continuum) attach
-    a :class:`WorkerSelfReport` body carrying ``applied_route_version`` —
-    the only field that drives the STARTING-gate transition and the
-    Valkey ``cas_max`` monotonic update. Non-polling workers (NATIVE /
-    TRAEFIK) send an empty body and the handler treats them as a plain
-    liveness signal. Either way the handler refreshes ``last_polled_at``
-    on the row and the ``proxy-worker.last_seen`` Valkey hash that
-    ``check_worker_lost`` consults.
+    Workers — push or polling — send an empty body as a plain liveness
+    ping. The handler refreshes ``last_polled_at`` on the row and the
+    ``proxy-worker.last_seen`` Valkey hash that ``check_worker_lost``
+    consults, and promotes the worker out of LOST if it had been marked.
     """
 
     root_ctx: RootContext = request.app["_root.context"]
     worker_id = UUID(request.match_info["worker_id"])
 
-    report: WorkerSelfReport | None
-    if request.content_length:
-        try:
-            body = await request.json()
-        except Exception as e:
-            raise GenericBadRequest(f"Invalid JSON body: {e}") from e
-        try:
-            report = WorkerSelfReport.model_validate(body)
-        except ValidationError as e:
-            raise GenericBadRequest(f"Invalid WorkerSelfReport: {e}") from e
-    else:
-        report = None
-
     now = datetime.now(UTC)
-    applied_route_version = int(report.applied_route_version) if report else 0
 
     async def _update(sess: SASession) -> str:
         worker = await Worker.get(sess, worker_id)
         worker.last_polled_at = now
-        # OPS-2 mitigation: a polling worker stays in STARTING until the
-        # data plane actually applies its first snapshot. Promote
-        # STARTING → ALIVE inside the same transaction as
-        # ``last_polled_at`` so the cold-start gate flips atomically;
-        # ALIVE workers are eligible for pick_worker assignment from the
-        # next request onward. For non-polling workers the body is empty
-        # and we simply keep them ALIVE.
-        if worker.status == WorkerStatus.STARTING and applied_route_version > 0:
-            worker.status = WorkerStatus.ALIVE
-            log.info(
-                "Worker {} cold-start complete (applied_route_version={}); STARTING -> ALIVE",
-                worker_id,
-                applied_route_version,
-            )
-        elif worker.status != WorkerStatus.ALIVE and applied_route_version == 0:
-            # Non-polling NATIVE / TRAEFIK workers — empty body, no
-            # cold-start gate. Flip to ALIVE if they were marked LOST
-            # by an earlier missed heartbeat.
+        if worker.status != WorkerStatus.ALIVE:
             worker.status = WorkerStatus.ALIVE
         return worker.authority
 
     async with root_ctx.db.connect() as db_conn:
         authority = await execute_with_txn_retry(_update, root_ctx.db.begin_session, db_conn)
 
-    # check_worker_lost still scans the ``proxy-worker.last_seen`` Valkey
-    # hash. Update it for every heartbeat — polling and non-polling alike.
     ttl = get_default_redis_key_ttl()
     await root_ctx.valkey_live.hset_with_expiry(
         "proxy-worker.last_seen",
         {authority: str(now.timestamp())},
         ttl,
     )
-
-    # RC-3: cas_max is atomic compare-and-set on max — slow heartbeats can no
-    # longer overwrite a newer committed value. Only relevant for polling
-    # workers; non-polling workers contribute 0 which the CAS ignores.
-    if applied_route_version > 0:
-        key = f"proxy-worker.committed_route_version:{worker_id}"
-        await root_ctx.valkey_live.cas_max(key, applied_route_version, ex=60)
 
     request["do_not_print_access_log"] = True
     return web.json_response(
@@ -240,10 +195,6 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
     ``WorkerResponseModel`` (worker row + slots) so older Python workers
     can refresh their cached slot list, while v3 returns the minimal
     :class:`WorkerRegistrationResponseV3` (worker id only).
-
-    The endpoint itself signals "this is a polling worker" — handlers
-    flip the initial status to STARTING when the resolved backend_kind
-    is CONTINUUM (polling). The legacy v2 endpoint enters at ALIVE.
     """
 
     root_ctx: RootContext = request.app["_root.context"]
@@ -264,10 +215,7 @@ async def register_v3(request: web.Request) -> web.StreamResponse:
     # and is not stored as a separate column.
     backend_kind = params.backend_kind or BackendKind.CONTINUUM
 
-    # OPS-2: polling workers start in STARTING and transition to ALIVE
-    # on the first heartbeat carrying ``applied_route_version > 0``.
-    is_polling = backend_kind == BackendKind.CONTINUUM
-    initial_status = WorkerStatus.STARTING if is_polling else WorkerStatus.ALIVE
+    initial_status = WorkerStatus.ALIVE
     accepted_traffics = list(params.accepted_traffics)
     port_range: tuple[int, int] | None = (
         (params.port_range[0], params.port_range[1]) if params.port_range else None

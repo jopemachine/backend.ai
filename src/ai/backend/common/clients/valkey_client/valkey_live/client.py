@@ -14,7 +14,6 @@ from glide import (
     ExpiryType,
     InfBound,
     ScoreBoundary,
-    Script,
 )
 
 from ai.backend.common.clients.valkey_client.client import (
@@ -53,24 +52,6 @@ valkey_live_resilience = Resilience(
 
 _DEFAULT_EXPIRATION = 3600  # 1 hour default expiration
 
-# Atomic compare-and-set on max — used by AppProxy v3 polling endpoints to
-# update the per-worker committed_route_version monotonically. Stores
-# ``new`` only when it is strictly greater than the current value (or the
-# key does not yet exist). Returns the resulting value.
-_CAS_MAX_SCRIPT: Final[str] = """
-local current = redis.call('GET', KEYS[1])
-local new = tonumber(ARGV[1])
-local ex = tonumber(ARGV[2])
-if current == false or tonumber(current) < new then
-  if ex and ex > 0 then
-    redis.call('SET', KEYS[1], new, 'EX', ex)
-  else
-    redis.call('SET', KEYS[1], new)
-  end
-  return new
-end
-return current
-"""
 _SESSION_REQUESTS_SUFFIX: Final[str] = "requests"
 _SESSION_LAST_RESPONSE_SUFFIX: Final[str] = "last_response_time"
 _AGENT_LAST_SEEN_HASH: Final[str] = "agent.last_seen"
@@ -84,12 +65,10 @@ class ValkeyLiveClient:
 
     _client: AbstractValkeyClient
     _closed: bool
-    _cas_max_script: Script
 
     def __init__(self, client: AbstractValkeyClient) -> None:
         self._client = client
         self._closed = False
-        self._cas_max_script = Script(_CAS_MAX_SCRIPT)
 
     @classmethod
     async def create(
@@ -173,32 +152,6 @@ class ValkeyLiveClient:
             return []
         async with self._client.client() as conn:
             return await conn.mget(cast(list[str | bytes], keys))
-
-    @valkey_live_resilience.apply()
-    async def cas_max(
-        self,
-        key: str,
-        value: int,
-        *,
-        ex: int | None = None,
-    ) -> int:
-        """Atomically set ``key`` to ``value`` iff ``value`` is strictly
-        greater than the current value (or the key is absent).
-
-        Returns the value held after the operation (either the newly
-        written ``value`` or the pre-existing larger one).
-        """
-        async with self._client.client() as conn:
-            raw_result = await conn.invoke_script(
-                self._cas_max_script,
-                keys=[key],
-                args=[str(value), str(ex) if ex is not None else "0"],
-            )
-        if isinstance(raw_result, (bytes, bytearray)):
-            return int(raw_result.decode("ascii"))
-        if isinstance(raw_result, str):
-            return int(raw_result)
-        return int(cast(Any, raw_result))
 
     @valkey_live_resilience.apply()
     async def store_live_data(
