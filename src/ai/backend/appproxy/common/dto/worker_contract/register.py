@@ -16,7 +16,7 @@ poll-token issuance / refresh.
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from pydantic import Field
@@ -140,34 +140,13 @@ class WorkerRegistrationRequest(BaseRequestModel):
         ),
     ]
 
-    # --- Backend kind and capability advertisement -----------------------
+    # --- Backend kind ----------------------------------------------------
     backend_kind: Annotated[
         BackendKind | None,
         Field(
             default=None,
             description=(
                 "BackendKind the worker drives (``native`` | ``traefik`` | ``continuum``). Older workers omit this."
-            ),
-        ),
-    ]
-    capabilities: Annotated[
-        dict[str, Any] | None,
-        Field(
-            default=None,
-            description=(
-                "Capability dict the worker advertises. ``supports_v3_polling=true`` flips the coordinator "
-                "to STARTING-until-first-apply cold-start gating; ``formats`` lists the snapshot formats "
-                "the worker can consume."
-            ),
-        ),
-    ]
-    scope: Annotated[
-        dict[str, Any] | None,
-        Field(
-            default=None,
-            description=(
-                "Optional scope filter (project_ids / scaling_group / backend_kinds) the worker handles. "
-                "Empty / None means no filter."
             ),
         ),
     ]

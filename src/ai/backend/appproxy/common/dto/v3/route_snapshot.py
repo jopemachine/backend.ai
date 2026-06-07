@@ -5,7 +5,6 @@ Pydantic v2 DTOs for the v3 route-snapshot polling protocol.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import Field
@@ -13,71 +12,11 @@ from pydantic import Field
 from ai.backend.common.api_handlers import BaseResponseModel
 
 __all__ = (
-    "ContinuumNativeSnapshot",
     "EndpointDTO",
     "ReplicaDTO",
-    "SubprocessHealth",
-    "TraefikNativeSnapshot",
     "UnifiedRouteSnapshot",
-    "WorkerCapabilities",
-    "WorkerScope",
     "WorkerSelfReport",
 )
-
-
-SubprocessHealth = Literal[
-    "starting",
-    "running",
-    "crashed",
-    "draining",
-]
-
-
-# 5 MiB — conservative ceiling that fits typical route fan-outs while
-# bounding worst-case memory use per poll.
-_DEFAULT_MAX_PAYLOAD_BYTES: int = 5 * 1024 * 1024
-
-
-class WorkerCapabilities(BaseResponseModel):
-    """Capability advertisement a worker sends when registering for v3 polling."""
-
-    supports_v3_polling: bool = Field(
-        description="Whether the worker speaks the v3 polling protocol.",
-    )
-    formats: list[str] = Field(
-        description=(
-            "Snapshot formats the worker can consume "
-            "(e.g. ``unified``, ``traefik_native``, ``continuum_native``)."
-        ),
-    )
-    poll_interval_ms: int = Field(
-        default=5000,
-        ge=0,
-        description="Desired interval between successive polls, in milliseconds.",
-    )
-    max_payload_bytes: int = Field(
-        default=_DEFAULT_MAX_PAYLOAD_BYTES,
-        ge=0,
-        description="Maximum snapshot payload size the worker is willing to accept, in bytes.",
-    )
-
-
-class WorkerScope(BaseResponseModel):
-    """Filter declaring which subset of routes a worker is responsible for."""
-
-    project_ids: list[UUID] | None = Field(
-        default=None,
-        description="Project UUIDs the worker serves. ``None`` means no project filter.",
-    )
-    scaling_group: str | None = Field(
-        default=None,
-        description="Scaling group the worker is attached to. ``None`` means no scaling-group filter.",
-    )
-    backend_kinds: list[str] | None = Field(
-        default=None,
-        description="Backend kinds (e.g. ``traefik``, ``continuum``) the worker handles. "
-        "``None`` means no backend-kind filter.",
-    )
 
 
 class ReplicaDTO(BaseResponseModel):
@@ -117,88 +56,35 @@ class EndpointDTO(BaseResponseModel):
 
 
 class UnifiedRouteSnapshot(BaseResponseModel):
-    """Format-agnostic route snapshot consumed by every worker backend."""
+    """Backend-kind-agnostic route snapshot consumed by every worker.
+
+    Workers receive this abstract shape (endpoints + replicas) and translate
+    it into their own data-plane format (nghttpx / Traefik dynamic config /
+    Continuum router config). Pre-translation on the Coordinator side
+    (per-backend snapshot formats) is a future option once a worker-side
+    adapter cost becomes load-bearing — for now the worker-side adapter
+    handles it.
+    """
 
     route_version: int = Field(
         ge=0,
         description="Monotonically increasing version identifying this snapshot.",
     )
     issued_at: datetime = Field(description="Timestamp at which the snapshot was issued.")
-    scope_fingerprint: str = Field(
-        description="Stable hash of the scope filter used to produce this snapshot.",
-    )
     endpoints: list[EndpointDTO] = Field(description="Endpoints included in the snapshot.")
 
 
-class TraefikNativeSnapshot(BaseResponseModel):
-    """Traefik-native snapshot variant.
-
-    TODO: populate ``http`` with the concrete ``routers``/``services``/
-    ``middlewares`` schemas once the Traefik adapter contract is finalised.
-    """
-
-    route_version: int = Field(
-        ge=0,
-        description="Monotonically increasing version identifying this snapshot.",
-    )
-    issued_at: datetime = Field(description="Timestamp at which the snapshot was issued.")
-    http: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Traefik dynamic HTTP configuration (routers/services/middlewares).",
-    )
-
-
-class ContinuumNativeSnapshot(BaseResponseModel):
-    """Continuum-router-native snapshot variant.
-
-    ``backends`` and ``models`` are stubbed as opaque dicts pending the final
-    Continuum schema.
-    """
-
-    route_version: int = Field(
-        ge=0,
-        description="Monotonically increasing version identifying this snapshot.",
-    )
-    issued_at: datetime = Field(description="Timestamp at which the snapshot was issued.")
-    backends: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Continuum backend definitions (schema TBD).",
-    )
-    models: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Continuum model definitions (schema TBD).",
-    )
-
-
 class WorkerSelfReport(BaseResponseModel):
-    """Health/state self-report a worker attaches to each poll."""
+    """Heartbeat body sent by polling workers.
 
-    current_route_version: int = Field(
-        ge=0,
-        description="Route version currently in effect on the worker.",
-    )
-    polled_route_version: int = Field(
-        ge=0,
-        description="Route version observed in the most recent poll response.",
-    )
+    Only ``applied_route_version`` drives Coordinator behaviour — it feeds
+    the STARTING-gate transition and the Valkey ``cas_max`` monotonic
+    update. Additional observability fields (subprocess health, in-flight
+    counts, last-poll status) belong in a dedicated metrics channel rather
+    than the wire contract.
+    """
+
     applied_route_version: int = Field(
         ge=0,
-        description="Route version successfully applied to the subprocess.",
-    )
-    last_poll_status_code: int = Field(
-        description="HTTP status code returned by the most recent poll.",
-    )
-    last_poll_timestamp: datetime = Field(
-        description="Timestamp of the most recent poll attempt.",
-    )
-    subprocess_health: SubprocessHealth = Field(
-        description="Current lifecycle state of the proxy subprocess.",
-    )
-    route_count: int = Field(
-        ge=0,
-        description="Number of routes currently programmed into the subprocess.",
-    )
-    in_flight_requests: int = Field(
-        ge=0,
-        description="Number of requests currently in flight on the worker.",
+        description="Route version successfully applied to the worker's data plane.",
     )

@@ -25,12 +25,7 @@ for any field defined in this module.
 
 from __future__ import annotations
 
-from ai.backend.appproxy.common.dto.v3.route_snapshot import (
-    SubprocessHealth,
-    WorkerCapabilities,
-    WorkerScope,
-    WorkerSelfReport,
-)
+from ai.backend.appproxy.common.dto.v3.route_snapshot import WorkerSelfReport
 
 from .heartbeat import WorkerHeartbeatResponse
 from .register import (
@@ -45,8 +40,4 @@ __all__ = (
     # Heartbeat
     "WorkerHeartbeatResponse",
     "WorkerSelfReport",
-    "SubprocessHealth",
-    # Re-exports from v3/route_snapshot.py (kept canonical here)
-    "WorkerCapabilities",
-    "WorkerScope",
 )
