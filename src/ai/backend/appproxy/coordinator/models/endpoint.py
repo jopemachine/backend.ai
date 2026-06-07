@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql as pgsql
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column, relationship, selectinload
 
@@ -40,6 +41,27 @@ class Endpoint(Base, BaseMixin):  # type: ignore[misc]
     health_check_enabled: Mapped[bool] = mapped_column(sa.Boolean(), nullable=False, default=False)
     health_check_config: Mapped[ModelHealthCheck | None] = mapped_column(
         StructuredJSONObjectColumn(ModelHealthCheck), nullable=True
+    )
+
+    # OB-COMP-2 mitigation — fields the manager pushes via the bulk
+    # endpoint create DTO so the coordinator can describe routes whose
+    # upstream is an external API rather than a Backend.AI kernel.
+    # Nullable / defaulted so older managers that omit them keep working.
+    external_backend_type: Mapped[str] = mapped_column(
+        sa.String(length=64),
+        nullable=False,
+        default="ba_kernel",
+        server_default=sa.text("'ba_kernel'"),
+    )
+    credential_ref: Mapped[str | None] = mapped_column(
+        sa.String(length=255),
+        nullable=True,
+    )
+    model_aliases: Mapped[list[str]] = mapped_column(
+        pgsql.JSONB,
+        nullable=False,
+        default=list,
+        server_default=sa.text("'[]'::jsonb"),
     )
 
     created_at: Mapped[datetime | None] = mapped_column(
@@ -97,9 +119,19 @@ class Endpoint(Base, BaseMixin):  # type: ignore[misc]
         endpoint_id: UUID,
         health_check_enabled: bool = False,
         health_check_config: ModelHealthCheck | None = None,
+        *,
+        external_backend_type: str = "ba_kernel",
+        credential_ref: str | None = None,
+        model_aliases: list[str] | None = None,
     ) -> "Endpoint":
         endpoint = cls()
         endpoint.id = endpoint_id
         endpoint.health_check_enabled = health_check_enabled
         endpoint.health_check_config = health_check_config
+        endpoint.external_backend_type = external_backend_type
+        endpoint.credential_ref = credential_ref
+        # ``list(...)`` guards against the caller mutating the default
+        # after construction — the column is JSONB so a shared mutable
+        # default would propagate across endpoints.
+        endpoint.model_aliases = list(model_aliases or [])
         return endpoint

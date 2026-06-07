@@ -585,16 +585,29 @@ class EndpointRepository:
         health_check_config = item.health_check
         health_check_enabled = health_check_config is not None
 
+        # OB-COMP-2 mitigation: the additive fields on the DTO already
+        # default to legacy-equivalent values, so reading them
+        # unconditionally is safe even when the manager omits them.
+        external_backend_type = item.external_backend_type
+        credential_ref = item.credential_ref
+        model_aliases = list(item.model_aliases)
+
         # Upsert endpoint row using the bulk-fetched snapshot.
         endpoint = endpoints_by_id.get(item.deployment_id)
         if endpoint is not None:
             endpoint.health_check_enabled = health_check_enabled
             endpoint.health_check_config = health_check_config
+            endpoint.external_backend_type = external_backend_type
+            endpoint.credential_ref = credential_ref
+            endpoint.model_aliases = model_aliases
         else:
             endpoint = Endpoint.create(
                 endpoint_id=item.deployment_id,
                 health_check_enabled=health_check_enabled,
                 health_check_config=health_check_config,
+                external_backend_type=external_backend_type,
+                credential_ref=credential_ref,
+                model_aliases=model_aliases,
             )
             sess.add(endpoint)
             endpoints_by_id[item.deployment_id] = endpoint
