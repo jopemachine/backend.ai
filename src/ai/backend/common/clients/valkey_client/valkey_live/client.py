@@ -14,6 +14,7 @@ from glide import (
     ExpiryType,
     InfBound,
     ScoreBoundary,
+    Script,
 )
 
 from ai.backend.common.clients.valkey_client.client import (
@@ -55,6 +56,20 @@ _SESSION_REQUESTS_SUFFIX: Final[str] = "requests"
 _SESSION_LAST_RESPONSE_SUFFIX: Final[str] = "last_response_time"
 _AGENT_LAST_SEEN_HASH: Final[str] = "agent.last_seen"
 
+# Lua script for atomic compare-and-set on max — only writes when the
+# proposed value is greater than or equal to the currently stored value.
+# Used by RC-3 (BA-6068) so a slow heartbeat cannot regress a newer
+# committed_route_version that a faster poll already published.
+_CAS_MAX_SCRIPT: Final[str] = """
+local cur = redis.call('GET', KEYS[1])
+local n = tonumber(ARGV[1])
+if cur == false or tonumber(cur) < n then
+    redis.call('SET', KEYS[1], n, 'EX', tonumber(ARGV[2]))
+    return n
+end
+return tonumber(cur)
+"""
+
 
 class ValkeyLiveClient:
     """
@@ -64,10 +79,15 @@ class ValkeyLiveClient:
 
     _client: AbstractValkeyClient
     _closed: bool
+    _cas_max_script: Script
 
     def __init__(self, client: AbstractValkeyClient) -> None:
         self._client = client
         self._closed = False
+        # Glide caches the script SHA on first invoke_script() call and
+        # transparently retries with SCRIPT LOAD on NOSCRIPT, so we only
+        # need to construct the Script wrapper once.
+        self._cas_max_script = Script(_CAS_MAX_SCRIPT)
 
     @classmethod
     async def create(
@@ -166,6 +186,52 @@ class ValkeyLiveClient:
         conditional_set = ConditionalChange.ONLY_IF_EXISTS if xx else None
         async with self._client.client() as conn:
             await conn.set(key, value, conditional_set=conditional_set, expiry=expiry)
+
+    @valkey_live_resilience.apply()
+    async def set_if_not_exists(
+        self,
+        key: str,
+        value: str | bytes,
+        *,
+        ex: int,
+    ) -> bool:
+        """SET NX EX semantics — returns True if the key was newly set, False if it already existed."""
+        expiry = ExpirySet(ExpiryType.SEC, ex)
+        async with self._client.client() as conn:
+            result = await conn.set(
+                key,
+                value,
+                conditional_set=ConditionalChange.ONLY_IF_DOES_NOT_EXIST,
+                expiry=expiry,
+            )
+        return result is not None
+
+    @valkey_live_resilience.apply()
+    async def cas_max(self, key: str, value: int, ex: int) -> int:
+        """Compare-and-set on max: only writes if new value >= existing.
+
+        Returns the value persisted after the call (max(existing, value)).
+        Used by RC-3 mitigation: heartbeats from a slow/restarted worker must
+        not overwrite a newer committed_route_version reported by a faster
+        poll cycle.
+        """
+        async with self._client.client() as conn:
+            result = await conn.invoke_script(
+                script=self._cas_max_script,
+                keys=[key],
+                args=[str(value), str(ex)],
+            )
+        # Glide returns the Lua return value as int (or bytes when stringy);
+        # the script returns a number so it comes back as int directly.
+        persisted = int(cast(int, result))
+        log.debug(
+            "cas_max(key={}, value={}, ex={}) -> {}",
+            key,
+            value,
+            ex,
+            persisted,
+        )
+        return persisted
 
     @valkey_live_resilience.apply()
     async def store_multiple_live_data(
