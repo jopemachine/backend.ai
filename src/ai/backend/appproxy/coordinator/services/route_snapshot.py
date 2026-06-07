@@ -13,20 +13,6 @@ Why content-hash ``route_version`` not Postgres sequence (P1 RC-1):
     raw data. Equal inputs produce equal versions; the etag is therefore
     stable across calls until the routing tree actually mutates, and
     304s become trustworthy.
-
-Secret payload separation (P0 SEC-4):
-    Earlier prototypes inlined ``jwt_verification_secret`` and
-    ``permit_hash_secret`` directly into the per-circuit Traefik
-    middleware payload. That made every snapshot a high-value target:
-    any log line, cache, or transient breach that captured the snapshot
-    body leaked the secrets used to mint and verify worker permits.
-    Mitigation (SEC-4): the formatters emit opaque references of the
-    form ``secret://worker/{worker_id}/{secret_kind}`` instead of the
-    secret value. The worker then fetches the actual material via a
-    separate, narrowly-scoped secret resolution endpoint that is out
-    of scope for this module. The snapshot body therefore never
-    contains a usable secret, and the resolution endpoint is the only
-    surface that needs hardening.
 """
 
 from __future__ import annotations
@@ -60,7 +46,7 @@ __all__ = [
 ]
 
 
-SnapshotFormat = Literal["unified", "traefik-native", "continuum-native"]
+SnapshotFormat = Literal["unified"]
 
 
 _SNAPSHOT_ETAG_CACHE_TTL_SEC: int = 600
@@ -108,7 +94,7 @@ class RouteSnapshotService:
     async def get_snapshot(
         self,
         worker_id: UUID,
-        format: SnapshotFormat,
+        format: SnapshotFormat = "unified",
         since: int | None = None,
         etag_hint: str | None = None,
     ) -> RouteSnapshotResult:
@@ -118,12 +104,11 @@ class RouteSnapshotService:
             1. Open ONE read-only session and read worker + circuits
                (with their endpoints) in one round-trip.
             2. Build a deterministic canonical representation of the
-               routing data and the worker scope.
-            3. Derive ``route_version`` and ``etag`` from those
-               canonical forms (RC-1).
+               routing data.
+            3. Derive ``route_version`` and ``etag`` from that
+               canonical form (RC-1).
             4. Short-circuit with ``304`` when ``etag_hint`` matches.
-            5. Otherwise dispatch to the requested formatter (SEC-4:
-               formatters emit opaque secret refs, never values).
+            5. Otherwise render the unified body.
             6. Cache the etag in valkey for downstream lookups.
 
         ``since`` is accepted for future delta-style responses; today
@@ -132,6 +117,7 @@ class RouteSnapshotService:
         when delta support lands.
         """
         del since  # reserved for future delta-snapshot support
+        del format  # only ``unified`` is supported today; reserved for future variants.
 
         # (1) Single read-only session covering every row we need.
         async with self._db.begin_readonly_session() as sess:
@@ -164,12 +150,9 @@ class RouteSnapshotService:
 
         generated_at = datetime.now(UTC)
 
-        # (2) Canonical representations — sorted-by-id, primitive-only.
+        # (2) Canonical representation — sorted-by-id, primitive-only.
         routes_canonical = self._canonical_routes_payload(circuit_rows, endpoint_rows)
-        scope_canonical = self._canonical_scope_payload(worker_row)
-
         routes_canonical_bytes = self._canonical_json(routes_canonical)
-        scope_canonical_bytes = self._canonical_json(scope_canonical)
 
         # (3) Content-hash route_version (RC-1: avoid nextval non-determinism).
         route_version = int.from_bytes(
@@ -177,14 +160,9 @@ class RouteSnapshotService:
             byteorder="big",
             signed=False,
         )
+        etag = f"v{route_version}"
 
-        # (4) Scope fingerprint + etag.
-        scope_fingerprint = hashlib.sha256(scope_canonical_bytes).hexdigest()[:32]
-        etag_seed = scope_fingerprint.encode("ascii") + str(route_version).encode("ascii")
-        etag_suffix = hashlib.sha256(etag_seed).hexdigest()[:12]
-        etag = f"v{route_version}:{etag_suffix}"
-
-        # (5) Cache the etag in valkey so adjacent endpoints (e.g. a
+        # (4) Cache the etag in valkey so adjacent endpoints (e.g. a
         # cheap HEAD-style probe) can short-circuit without rebuilding
         # the snapshot. Failure to cache is non-fatal: the snapshot is
         # already valid and the next call will recompute.
@@ -194,7 +172,7 @@ class RouteSnapshotService:
         except Exception as exc:  # pragma: no cover - best-effort cache
             log.debug("snapshot etag cache failed for {}: {}", worker_id, exc)
 
-        # (6) Short-circuit on etag match.
+        # (5) Short-circuit on etag match.
         if etag_hint is not None and etag_hint == etag:
             return RouteSnapshotResult(
                 status_code=304,
@@ -204,37 +182,13 @@ class RouteSnapshotService:
                 generated_at=generated_at,
             )
 
-        # (7) Dispatch to the requested formatter. Formatters never
-        # embed raw secret values (SEC-4).
-        body: dict[str, Any]
-        match format:
-            case "unified":
-                body = self._format_unified(
-                    worker_row=worker_row,
-                    circuit_rows=circuit_rows,
-                    endpoint_rows=endpoint_rows,
-                    route_version=route_version,
-                    scope_fingerprint=scope_fingerprint,
-                    generated_at=generated_at,
-                )
-            case "traefik-native":
-                body = self._format_traefik_native(
-                    worker_row=worker_row,
-                    circuit_rows=circuit_rows,
-                    endpoint_rows=endpoint_rows,
-                    route_version=route_version,
-                    scope_fingerprint=scope_fingerprint,
-                    generated_at=generated_at,
-                )
-            case "continuum-native":
-                body = self._format_continuum_native(
-                    worker_row=worker_row,
-                    circuit_rows=circuit_rows,
-                    endpoint_rows=endpoint_rows,
-                    route_version=route_version,
-                    scope_fingerprint=scope_fingerprint,
-                    generated_at=generated_at,
-                )
+        # (6) Render the unified body.
+        body = self._format_unified(
+            circuit_rows=circuit_rows,
+            endpoint_rows=endpoint_rows,
+            route_version=route_version,
+            generated_at=generated_at,
+        )
 
         return RouteSnapshotResult(
             status_code=200,
@@ -309,47 +263,17 @@ class RouteSnapshotService:
             "endpoints": endpoints_view,
         }
 
-    @staticmethod
-    def _canonical_scope_payload(worker_row: Worker | None) -> dict[str, Any]:
-        """Build the worker-scope view used for the etag suffix."""
-        if worker_row is None:
-            return {
-                "scope": {},
-                "backend_kind": None,
-                "mode": None,
-                "capabilities": {},
-            }
-        kind = worker_row.backend_kind
-        return {
-            "scope": worker_row.scope or {},
-            "backend_kind": str(kind),
-            # ``mode`` was retired as a column but the etag suffix keeps it
-            # for backward compatibility with cached fingerprints —
-            # derived from ``backend_kind`` so the payload stays stable.
-            "mode": kind.worker_mode if kind is not None else None,
-            "capabilities": worker_row.capabilities or {},
-        }
-
-    # ---- Formatters (SEC-4: no raw secret values, only opaque refs) ----
-
-    @staticmethod
-    def _secret_ref(worker_id: UUID, secret_kind: str) -> str:
-        """Build an opaque reference resolvable via the secret endpoint."""
-        return f"secret://worker/{worker_id}/{secret_kind}"
+    # ---- Formatter ----
 
     def _format_unified(
         self,
         *,
-        worker_row: Worker | None,
         circuit_rows: list[Circuit],
         endpoint_rows: list[Endpoint],
         route_version: int,
-        scope_fingerprint: str,
         generated_at: datetime,
     ) -> dict[str, Any]:
         """Unified cross-backend snapshot shape."""
-        del worker_row  # scope fingerprint already encodes worker scope.
-
         endpoint_dtos: list[EndpointDTO] = []
         endpoint_by_id: dict[UUID, Endpoint] = {endpoint.id: endpoint for endpoint in endpoint_rows}
 
@@ -365,7 +289,6 @@ class RouteSnapshotService:
         return {
             "route_version": route_version,
             "issued_at": generated_at.isoformat(),
-            "scope_fingerprint": scope_fingerprint,
             "endpoints": [dto.model_dump(mode="json") for dto in endpoint_dtos],
         }
 
@@ -396,94 +319,3 @@ class RouteSnapshotService:
             app=circuit.app or primary_model_name,
             replicas=replicas,
         )
-
-    def _format_traefik_native(
-        self,
-        *,
-        worker_row: Worker | None,
-        circuit_rows: list[Circuit],
-        endpoint_rows: list[Endpoint],
-        route_version: int,
-        scope_fingerprint: str,
-        generated_at: datetime,
-    ) -> dict[str, Any]:
-        """Traefik provider native shape (minimal valid skeleton).
-
-        Parity coverage (OB-COMP-3):
-            * ``http.routers`` / ``http.services`` / ``http.middlewares``
-              cover both the legacy port-based HTTP frontend and the
-              subdomain-based HTTP frontend — subdomain routing in
-              Traefik is just an HTTP router with a ``Host(...)`` rule,
-              so the same bucket carries both. The frontend mode is
-              propagated as metadata so the worker can distinguish a
-              port-based router from a subdomain-based one when it
-              materializes the rules.
-            * ``tcp.routers`` / ``tcp.services`` cover the TCP frontend
-              that the worker's ``TraefikTCPFrontend`` consumes via the
-              Traefik HTTP-provider ``tcpRouters`` / ``tcpServices``
-              keys. Even when empty, the buckets MUST be present so a
-              downstream Traefik instance reloading the dynamic config
-              does not 5xx on a missing top-level key.
-
-        TODO(BA-6068): populate the per-circuit ``routers`` /
-        ``services`` / ``middlewares`` entries from ``circuit_rows``.
-        Until that lands we emit an empty-but-well-formed structure so
-        the downstream Traefik provider can mount the snapshot without
-        errors. Per SEC-4, when the entries are populated the
-        ``jwt_secret`` / ``permit_hash_secret`` plugin params MUST be
-        replaced with opaque ``secret://`` refs — never raw values.
-        """
-        del worker_row, circuit_rows, endpoint_rows
-        return {
-            "route_version": route_version,
-            "issued_at": generated_at.isoformat(),
-            "scope_fingerprint": scope_fingerprint,
-            # HTTP bucket: covers both port-based and subdomain-based
-            # HTTP frontends. Subdomain routing is expressed inside
-            # ``routers`` as standard Traefik ``Host(...)`` rules.
-            "http": {
-                # TODO(BA-6068): per-circuit HTTP routers keyed by
-                # circuit id (port-based and subdomain-based alike).
-                "routers": {},
-                # TODO(BA-6068): per-circuit HTTP load-balancer services.
-                "services": {},
-                # TODO(BA-6068): permit-hash / JWT middlewares; secrets
-                # must be opaque ``secret://`` refs (SEC-4).
-                "middlewares": {},
-            },
-            # TCP bucket: covers the worker's TraefikTCPFrontend. Empty
-            # but present so the Traefik HTTP provider does not fail to
-            # decode the dynamic config payload.
-            "tcp": {
-                # TODO(BA-6068): per-circuit TCP routers keyed by
-                # circuit id.
-                "routers": {},
-                # TODO(BA-6068): per-circuit TCP load-balancer services.
-                "services": {},
-            },
-        }
-
-    def _format_continuum_native(
-        self,
-        *,
-        worker_row: Worker | None,
-        circuit_rows: list[Circuit],
-        endpoint_rows: list[Endpoint],
-        route_version: int,
-        scope_fingerprint: str,
-        generated_at: datetime,
-    ) -> dict[str, Any]:
-        """Continuum-router native shape (minimal valid skeleton).
-
-        TODO(BA-6068): build ``backends`` and ``models`` from the
-        loaded circuits / endpoints. Continuum auth material must be
-        exposed via opaque ``secret://`` refs only (SEC-4).
-        """
-        del worker_row, circuit_rows, endpoint_rows
-        return {
-            "route_version": route_version,
-            "issued_at": generated_at.isoformat(),
-            "scope_fingerprint": scope_fingerprint,
-            "backends": [],
-            "models": [],
-        }
