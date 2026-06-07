@@ -828,6 +828,12 @@ class ProxyWorkerConfig(BaseSchema):
             case FrontendServerMode.TRAEFIK:
                 if self.traefik is None:
                     raise ValueError("traefik must be set when frontend_mode = 'traefik'")
+            case FrontendServerMode.CONTINUUM:
+                raise ValueError(
+                    "frontend_mode = 'continuum' is not handled by the Python worker. "
+                    "Continuum workers register with the coordinator directly from the "
+                    "continuum-router binary; no Python worker process is involved."
+                )
         return self
 
     @model_validator(mode="after")
