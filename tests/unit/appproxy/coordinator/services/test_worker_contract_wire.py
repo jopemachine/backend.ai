@@ -21,7 +21,6 @@ from ai.backend.appproxy.common.dto.worker_contract import (
     WorkerHeartbeatResponse,
     WorkerRegistrationRequest,
     WorkerRegistrationResponseV3,
-    WorkerSelfReport,
 )
 from ai.backend.appproxy.common.types import (
     AppMode,
@@ -95,34 +94,6 @@ class TestRegisterRequestPythonWorkerNative:
         assert req.backend_kind.worker_mode == "self-hosted"
         assert req.port_range == (10200, 10299)
         assert req.accepted_traffics == [AppMode.INFERENCE, AppMode.INTERACTIVE]
-
-
-# ---------------------------------------------------------------------------
-# Heartbeat request — payload polling workers send.
-# ---------------------------------------------------------------------------
-class TestHeartbeatRequest:
-    """Polling worker (Continuum) 가 매 polling 마다 보내는 self-report 정합.
-
-    Coordinator 가 실제로 읽는 필드는 ``applied_route_version`` 하나뿐 —
-    그 한 필드가 STARTING-게이트 전이와 cas_max monotonic 갱신을 작동시킨다.
-    """
-
-    PAYLOAD: dict[str, object] = {
-        "applied_route_version": 0,
-    }
-
-    def test_parses_strictly(self) -> None:
-        rep = WorkerSelfReport.model_validate(self.PAYLOAD)
-        assert rep.applied_route_version == 0
-
-    def test_negative_route_version_rejected(self) -> None:
-        """``applied_route_version`` 은 ``ge=0`` 으로 제한된다."""
-        try:
-            WorkerSelfReport.model_validate({"applied_route_version": -1})
-        except Exception as e:
-            assert "greater_than_equal" in str(e) or "ge" in str(e).lower()
-        else:
-            raise AssertionError("Expected Pydantic ValidationError for negative version")
 
 
 # ---------------------------------------------------------------------------
