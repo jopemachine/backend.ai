@@ -25,8 +25,6 @@ for any field defined in this module.
 
 from __future__ import annotations
 
-from ai.backend.appproxy.common.dto.v3.route_snapshot import WorkerSelfReport
-
 from .heartbeat import WorkerHeartbeatResponse
 from .register import (
     WorkerRegistrationRequest,
@@ -39,5 +37,4 @@ __all__ = (
     "WorkerRegistrationResponseV3",
     # Heartbeat
     "WorkerHeartbeatResponse",
-    "WorkerSelfReport",
 )

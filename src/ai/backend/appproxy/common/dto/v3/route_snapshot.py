@@ -15,7 +15,6 @@ __all__ = (
     "EndpointDTO",
     "ReplicaDTO",
     "UnifiedRouteSnapshot",
-    "WorkerSelfReport",
 )
 
 
@@ -68,23 +67,11 @@ class UnifiedRouteSnapshot(BaseResponseModel):
 
     route_version: int = Field(
         ge=0,
-        description="Monotonically increasing version identifying this snapshot.",
+        description=(
+            "Content-hash identifier of the routing tree at snapshot time. "
+            "Stable across calls with the same DB state — used by the "
+            "Coordinator as the ETag value for If-None-Match short-circuit."
+        ),
     )
     issued_at: datetime = Field(description="Timestamp at which the snapshot was issued.")
     endpoints: list[EndpointDTO] = Field(description="Endpoints included in the snapshot.")
-
-
-class WorkerSelfReport(BaseResponseModel):
-    """Heartbeat body sent by polling workers.
-
-    Only ``applied_route_version`` drives Coordinator behaviour — it feeds
-    the STARTING-gate transition and the Valkey ``cas_max`` monotonic
-    update. Additional observability fields (subprocess health, in-flight
-    counts, last-poll status) belong in a dedicated metrics channel rather
-    than the wire contract.
-    """
-
-    applied_route_version: int = Field(
-        ge=0,
-        description="Route version successfully applied to the worker's data plane.",
-    )
