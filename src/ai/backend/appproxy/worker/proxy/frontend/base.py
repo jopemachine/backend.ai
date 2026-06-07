@@ -56,8 +56,8 @@ class BaseFrontend[TBackend: BaseBackend, TCircuitKeyType: (int, str)](metaclass
         except Exception:
             log.exception("Failed to terminate backend for circuit {}: {}", key)
         finally:
-            del self.backends[key]
-            del self.circuits[key]
+            self.backends.pop(key, None)
+            self.circuits.pop(key, None)
             metrics.circuit.observe_circuit_removal(protocol=circuit.protocol.name)
 
     async def terminate_all_circuits(self) -> None:

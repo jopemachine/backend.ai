@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+import aiohttp
 from prometheus_client.parser import text_string_to_metric_families
 
 from ai.backend.appproxy.common.types import RouteInfo
@@ -82,6 +83,21 @@ async def gather_prometheus_inference_measures(
             async with client_session.get(request_path) as resp:
                 resp.raise_for_status()
                 metrics_text = await resp.text()
+        except (
+            TimeoutError,
+            aiohttp.ClientConnectorError,
+            aiohttp.ServerDisconnectedError,
+            ConnectionRefusedError,
+        ) as e:
+            # Stale endpoints (deployment deleted, kernel died) — single-line
+            # warning without traceback to keep the log readable.
+            log.warning(
+                "metrics scrape: {}:{} unreachable ({}), skipping",
+                route.current_kernel_host,
+                route.kernel_port,
+                type(e).__name__,
+            )
+            continue
         except Exception:
             log.warning(
                 "Failed to collect metrics from route {} ({}:{}), skipping",

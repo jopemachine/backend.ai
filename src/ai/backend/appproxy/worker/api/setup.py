@@ -161,6 +161,14 @@ async def setup(
         "Access-Control-Expose-Headers": "*",
         "Cache-Control": "no-store",
     }
+    # Every ``FrontendServerMode`` branch above raises on a missing
+    # config section, so by this point ``port_config`` is guaranteed
+    # non-None. The explicit narrowing keeps mypy happy without
+    # re-deriving the type at every call site.
+    if port_config is None:
+        raise ServerMisconfiguredError(
+            "proxy_worker: no port/wildcard config resolved for the active frontend mode"
+        )
     match circuit.protocol:
         case ProxyProtocol.HTTP:
             protocol = "https" if use_tls else "http"
