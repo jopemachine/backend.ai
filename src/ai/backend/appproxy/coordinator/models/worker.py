@@ -38,19 +38,6 @@ from .circuit import Circuit
 
 log = BraceStyleAdapter(logging.getLogger(__spec__.name))
 
-# Default ordering of backend_kind for pick_worker tie-break. Workers with
-# kinds earlier in this list are preferred when multiple workers can serve
-# the same circuit. EXTERNAL_BACKEND variants (continuum, traefik) are
-# preferred over NATIVE because they expose richer routing capabilities
-# (smart routing, response caching, fallback chains) at no extra cost when
-# the workload doesn't require them. NATIVE remains a valid fallback for
-# workers that don't run an external dataplane.
-_PICK_WORKER_BACKEND_KIND_PRIORITY: dict[BackendKind, int] = {
-    BackendKind.CONTINUUM: 0,
-    BackendKind.TRAEFIK: 1,
-    BackendKind.NATIVE: 2,
-}
-
 __all__ = [
     "Worker",
     "WorkerAppFilter",
@@ -62,19 +49,19 @@ __all__ = [
 ]
 
 
-# OB-OPS-1 mitigation predicate. See:
-#   - is_v3_polling_active() below for the full rationale.
-#   - ai.backend.appproxy.coordinator.types.CircuitManager for the consumer
-#     sites that gate AppProxyCircuit*Event broadcasts on this predicate.
-_V3_POLLING_CAPABILITY_KEY = "supports_v3_polling"
+def _is_polling_worker(worker: "Worker") -> bool:
+    """Polling-worker check. CONTINUUM is the only polling backend today;
+    NATIVE / TRAEFIK keep the v2 push channel. When NATIVE/TRAEFIK go
+    polling in a future iteration the check expands here in one place.
+    """
+    return worker.backend_kind == BackendKind.CONTINUUM
 
 
 def is_v3_polling_active(worker: "Worker") -> bool:
     """Return True iff the worker has fully cut over to v3 snapshot polling.
 
     OB-OPS-1 rollout-ordering mitigation:
-        A worker may declare ``supports_v3_polling = True`` in its
-        ``capabilities`` payload at registration time, but the coordinator
+        A polling worker registers via the v3 endpoint, but the coordinator
         cannot stop emitting legacy ``AppProxyCircuit*Event`` broadcasts to
         that worker until the worker has actually pulled and applied at
         least one snapshot. Until then, the worker still depends on the
@@ -82,46 +69,25 @@ def is_v3_polling_active(worker: "Worker") -> bool:
         events would leave it with an empty / stale route table.
 
         We therefore require BOTH:
-          1. ``capabilities['supports_v3_polling']`` is truthy — the worker
-             declared it can poll snapshots.
+          1. The worker is a polling worker (``backend_kind == CONTINUUM``).
           2. ``committed_route_version > 0`` — the worker has reported back
              at least one successfully applied snapshot, so it is now the
              authoritative source for its own routing state and the legacy
              event channel can be safely silenced.
-
-        Either condition alone is insufficient:
-          * (1) alone is the rollout-ordering bug: capability flipped but
-            no snapshot yet applied.
-          * (2) alone never happens in practice (workers that don't poll
-            cannot commit a route version), but the explicit check keeps
-            the predicate robust against future code paths that might
-            seed ``committed_route_version`` for other reasons.
-
-    The check is intentionally a plain dict lookup (no SQL) so it is cheap
-    enough to call once per broadcast target.
     """
-    capabilities = worker.capabilities or {}
-    if not capabilities.get(_V3_POLLING_CAPABILITY_KEY):
+    if not _is_polling_worker(worker):
         return False
     return worker.committed_route_version > 0
 
 
 def _is_polling_ready(worker: "Worker") -> bool:
-    """OB-COMP-4 mitigation: only v3-polling workers must show
+    """OB-COMP-4 mitigation: only polling workers must show
     ``committed_route_version > 0`` before they become candidates for
-    ``pick_worker``. Legacy NATIVE / SELF_HOSTED workers never call the v3
-    polling endpoints, so their ``committed_route_version`` stays at the
-    seed value of 0 forever — applying the freshness gate uniformly would
-    permanently exclude them from circuit assignment (silent regression).
-
-    The check mirrors the capability lookup used by ``is_v3_polling_active``:
-        * If the worker did NOT declare ``supports_v3_polling``, return True
-          unconditionally — it is a legacy worker exempt from the gate.
-        * If it DID declare the capability, require at least one applied
-          snapshot (``committed_route_version > 0``) before it is eligible.
+    ``pick_worker``. Push workers (NATIVE / TRAEFIK) never poll, so their
+    ``committed_route_version`` stays at 0 — applying the freshness gate
+    uniformly would permanently exclude them from circuit assignment.
     """
-    capabilities = worker.capabilities or {}
-    if not capabilities.get(_V3_POLLING_CAPABILITY_KEY):
+    if not _is_polling_worker(worker):
         return True
     return worker.committed_route_version > 0
 
@@ -148,12 +114,8 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
     )
 
     authority: Mapped[str] = mapped_column(
-        sa.String(length=255), nullable=False
+        sa.String(length=255), nullable=False, unique=True
     )  # Human-readable identity of each AppProxy worker, must be identical across all AppProxy workers under single VIP when HA is set up.
-    # NOTE: Uniqueness is enforced by the composite (authority, backend_kind)
-    # constraint declared in ``__table_args__`` — a single authority can be
-    # registered once per backend_kind so SELF_HOSTED and EXTERNAL_BACKEND
-    # variants can coexist without colliding.
     frontend_mode: Mapped[FrontendMode] = mapped_column(
         EnumType(FrontendMode), nullable=False
     )  # will be fixed as `port` when `protocol` is set to `tcp`
@@ -226,20 +188,6 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
         nullable=False,
     )
 
-    capabilities: Mapped[dict[str, Any]] = mapped_column(
-        pgsql.JSONB,
-        default=dict,
-        server_default=sa.text("'{}'::jsonb"),
-        nullable=False,
-    )  # v3 polling capability declaration: supports_v3_polling, formats, poll_interval_ms
-
-    scope: Mapped[dict[str, Any]] = mapped_column(
-        pgsql.JSONB,
-        default=dict,
-        server_default=sa.text("'{}'::jsonb"),
-        nullable=False,
-    )  # Worker routing scope: project_ids, scaling_group, backend_kinds
-
     committed_route_version: Mapped[int] = mapped_column(
         sa.BigInteger,
         default=0,
@@ -250,10 +198,6 @@ class Worker(Base, BaseMixin):  # type: ignore[misc]
     last_polled_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True),
         nullable=True,
-    )
-
-    __table_args__ = (
-        sa.UniqueConstraint("authority", "backend_kind", name="uq_workers_authority_backend_kind"),
     )
 
     filters = relationship(
@@ -546,7 +490,6 @@ async def pick_worker(
         for f in sorted(
             result.scalars().all(),
             key=lambda f: (
-                _PICK_WORKER_BACKEND_KIND_PRIORITY.get(f.backend_kind, 99),
                 0 if f.frontend_mode == FrontendMode.WILDCARD_DOMAIN else 1,
                 (f.occupied_slots - f.available_slots),
             ),
